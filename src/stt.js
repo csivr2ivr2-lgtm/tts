@@ -224,16 +224,25 @@ export function createSttEngine(options = {}) {
         const { pipeline } = await import("@huggingface/transformers");
         stage = "loading-model";
         emit(onEvent, { stage: "loading-model", model, dtype });
+        let lastTotalBucket = -10;
         pipe = await pipeline("automatic-speech-recognition", model, {
           dtype,
           device: "cpu",
           cache_dir: cacheDir,
           progress_callback: (info) => {
-            if (info?.status !== "progress_total" && info?.status !== "progress") return;
+            if (info?.status !== "progress_total") return;
             const progress = Number(info.progress);
-            if (info.status === "progress_total" || progress === 100 || (Number.isFinite(progress) && progress % 10 < 1)) {
-              emit(onEvent, { stage: "model-progress", status: info.status, file: info.file, progress: Number.isFinite(progress) ? progress : undefined, loaded: info.loaded, total: info.total });
-            }
+            if (!Number.isFinite(progress)) return;
+            const bucket = Math.min(100, Math.floor(progress / 10) * 10);
+            if (bucket <= lastTotalBucket) return;
+            lastTotalBucket = bucket;
+            emit(onEvent, {
+              stage: "model-progress",
+              status: "progress_total",
+              progress: Number(progress.toFixed(1)),
+              loaded: info.loaded,
+              total: info.total
+            });
           }
         });
         status = "ready";
