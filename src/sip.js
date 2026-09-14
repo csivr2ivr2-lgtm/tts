@@ -13,7 +13,7 @@ function reasonFromEvent(event) {
   return event.cause || event.reason || event.message || event.response?.reason_phrase || null;
 }
 
-function createNodeSipSocket(WebSocketCtor, url) {
+function createNodeSipSocket(WebSocketCtor, url, { onDiagnostic, origin, handshakeTimeoutMs = 10000 } = {}) {
   return new (class NodeSipSocket {
     constructor() {
       const parsed = new URL(url);
@@ -25,29 +25,58 @@ function createNodeSipSocket(WebSocketCtor, url) {
       this.ondata = () => {};
       this._ws = null;
       this._manualClose = false;
+      this._disconnectNotified = false;
     }
 
     connect() {
       if (this._ws && (this._ws.readyState === WebSocketCtor.OPEN || this._ws.readyState === WebSocketCtor.CONNECTING)) return;
       this._manualClose = false;
-      const ws = new WebSocketCtor(this.url, "sip", {
+      this._disconnectNotified = false;
+      const wsOptions = {
         perMessageDeflate: false,
-        handshakeTimeout: Number(process.env.SIP_WS_HANDSHAKE_TIMEOUT_MS || 10000)
-      });
+        handshakeTimeout: Number(handshakeTimeoutMs || 10000)
+      };
+      if (origin) wsOptions.origin = origin;
+      const ws = new WebSocketCtor(this.url, "sip", wsOptions);
       this._ws = ws;
 
-      ws.on("open", () => this.onconnect());
+      const notifyDisconnect = (error, code, reason) => {
+        if (this._disconnectNotified) return;
+        this._disconnectNotified = true;
+        this._ws = null;
+        onDiagnostic?.({ event: "disconnect", error: Boolean(error), code: code ?? null, reason: reason || null, at: Date.now() });
+        this.ondisconnect(Boolean(error), code, reason);
+      };
+
+      ws.on("open", () => {
+        onDiagnostic?.({ event: "open", at: Date.now() });
+        this.onconnect();
+      });
+      ws.on("upgrade", (response) => {
+        onDiagnostic?.({ event: "upgrade", statusCode: response?.statusCode || 101, at: Date.now() });
+      });
       ws.on("message", (data) => {
         const message = typeof data === "string" ? data : data.toString("utf8");
         this.ondata(message);
       });
+      ws.on("unexpected-response", (_request, response) => {
+        const code = Number(response?.statusCode || 0) || 1006;
+        const reason = `HTTP ${response?.statusCode || "?"} ${response?.statusMessage || "unexpected WebSocket response"}`;
+        onDiagnostic?.({ event: "unexpected-response", statusCode: response?.statusCode || null, statusMessage: response?.statusMessage || null, at: Date.now() });
+        try { response?.destroy?.(); } catch {}
+        try { ws.terminate(); } catch {}
+        notifyDisconnect(true, code, reason);
+      });
       ws.on("close", (code, reason) => {
         const text = Buffer.isBuffer(reason) ? reason.toString("utf8") : String(reason || "");
-        this._ws = null;
-        this.ondisconnect(!this._manualClose && code !== 1000, code, text);
+        notifyDisconnect(!this._manualClose && code !== 1000, code, text || (code === 1000 ? "normal closure" : "WebSocket closed"));
       });
       ws.on("error", (error) => {
-        console.error("[SIP] WSS error:", safeError(error));
+        const message = safeError(error);
+        console.error("[SIP] WSS error:", message);
+        onDiagnostic?.({ event: "error", error: message, at: Date.now() });
+        try { ws.terminate(); } catch {}
+        notifyDisconnect(true, 1006, message);
       });
     }
 
@@ -84,6 +113,9 @@ export function createSipController(options = {}) {
   const registerExpires = Number(options.registerExpires || process.env.SIP_REGISTER_EXPIRES || 300);
   const autoConnect = options.autoConnect ?? booleanEnv("SIP_AUTO_CONNECT", false);
   const rejectUnbridged = options.rejectUnbridged ?? booleanEnv("SIP_REJECT_UNBRIDGED", true);
+  const wsOrigin = String(options.wsOrigin || process.env.SIP_WS_ORIGIN || "").trim();
+  const wsHandshakeTimeoutMs = Number(options.wsHandshakeTimeoutMs || process.env.SIP_WS_HANDSHAKE_TIMEOUT_MS || 10000);
+  const connectTimeoutMs = Number(options.connectTimeoutMs || process.env.SIP_CONNECT_TIMEOUT_MS || 15000);
 
   let ua = null;
   let socket = null;
@@ -96,11 +128,13 @@ export function createSipController(options = {}) {
   let incomingCall = null;
   let imports = null;
   let connectPromise = null;
+  let lastTransport = null;
+  let connectTimeout = null;
 
-  const touch = (event, nextStatus = status, error = null) => {
+  const touch = (event, nextStatus = status, error = undefined) => {
     lastEvent = event;
     status = nextStatus;
-    lastError = error;
+    if (error !== undefined) lastError = error;
     lastChangedAt = Date.now();
     console.log(`[SIP] ${event} status=${status}`);
   };
@@ -111,6 +145,9 @@ export function createSipController(options = {}) {
     connected,
     registered,
     wsUrl,
+    wsOrigin: wsOrigin || null,
+    wsHandshakeTimeoutMs,
+    connectTimeoutMs,
     uri: uri || null,
     domain,
     autoConnect: Boolean(autoConnect),
@@ -119,6 +156,7 @@ export function createSipController(options = {}) {
     lastEvent,
     lastError,
     lastChangedAt,
+    lastTransport,
     incomingCall
   });
 
@@ -136,7 +174,8 @@ export function createSipController(options = {}) {
     nextUa.on("connecting", () => touch("connecting", "connecting"));
     nextUa.on("connected", () => {
       connected = true;
-      touch("wss-connected", registered ? "registered" : "connected");
+      if (connectTimeout) { clearTimeout(connectTimeout); connectTimeout = null; }
+      touch("wss-connected", registered ? "registered" : "connected", null);
     });
     nextUa.on("disconnected", (event) => {
       connected = false;
@@ -146,7 +185,8 @@ export function createSipController(options = {}) {
     nextUa.on("registered", () => {
       connected = true;
       registered = true;
-      touch("registered", "registered");
+      if (connectTimeout) { clearTimeout(connectTimeout); connectTimeout = null; }
+      touch("registered", "registered", null);
     });
     nextUa.on("unregistered", (event) => {
       registered = false;
@@ -190,7 +230,11 @@ export function createSipController(options = {}) {
     connectPromise = (async () => {
       try {
         const { JsSIP, WebSocketCtor } = await loadDeps();
-        socket = createNodeSipSocket(WebSocketCtor, wsUrl);
+        socket = createNodeSipSocket(WebSocketCtor, wsUrl, {
+          origin: wsOrigin || undefined,
+          handshakeTimeoutMs: wsHandshakeTimeoutMs,
+          onDiagnostic: (event) => { lastTransport = event; }
+        });
         ua = new JsSIP.UA({
           sockets: [socket],
           uri,
@@ -205,6 +249,16 @@ export function createSipController(options = {}) {
         wireUa(ua);
         touch("start", "connecting");
         ua.start();
+        if (connectTimeout) clearTimeout(connectTimeout);
+        connectTimeout = setTimeout(() => {
+          connectTimeout = null;
+          if (!connected && !registered && status === "connecting") {
+            const message = `SIP WSS connection timed out after ${connectTimeoutMs}ms`;
+            touch("connect-timeout", "error", message);
+            try { ua?.stop(); } catch {}
+          }
+        }, connectTimeoutMs);
+        connectTimeout.unref?.();
         return info();
       } catch (error) {
         ua = null;
@@ -221,6 +275,7 @@ export function createSipController(options = {}) {
   }
 
   async function disconnect() {
+    if (connectTimeout) { clearTimeout(connectTimeout); connectTimeout = null; }
     const current = ua;
     ua = null;
     socket = null;
@@ -233,5 +288,50 @@ export function createSipController(options = {}) {
     return info();
   }
 
-  return { connect, disconnect, info };
+  async function probe() {
+    const { WebSocketCtor } = await loadDeps();
+    const startedAt = Date.now();
+    return await new Promise((resolve) => {
+      let settled = false;
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        lastTransport = { ...result, at: Date.now() };
+        resolve({
+          ok: Boolean(result.ok),
+          wsUrl,
+          origin: wsOrigin || null,
+          elapsedMs: Date.now() - startedAt,
+          ...result
+        });
+      };
+      const opts = { perMessageDeflate: false, handshakeTimeout: wsHandshakeTimeoutMs };
+      if (wsOrigin) opts.origin = wsOrigin;
+      const ws = new WebSocketCtor(wsUrl, "sip", opts);
+      const timer = setTimeout(() => {
+        try { ws.terminate(); } catch {}
+        finish({ ok: false, stage: "timeout", error: `WebSocket probe timed out after ${connectTimeoutMs}ms` });
+      }, connectTimeoutMs);
+      timer.unref?.();
+      ws.on("open", () => {
+        finish({ ok: true, stage: "open", protocol: ws.protocol || "sip" });
+        try { ws.close(1000, "probe complete"); } catch {}
+      });
+      ws.on("unexpected-response", (_req, response) => {
+        const result = { ok: false, stage: "unexpected-response", statusCode: response?.statusCode || null, statusMessage: response?.statusMessage || null };
+        try { response?.destroy?.(); } catch {}
+        try { ws.terminate(); } catch {}
+        finish(result);
+      });
+      ws.on("error", (error) => finish({ ok: false, stage: "error", error: safeError(error) }));
+      ws.on("close", (code, reason) => {
+        if (settled) return;
+        const text = Buffer.isBuffer(reason) ? reason.toString("utf8") : String(reason || "");
+        finish({ ok: false, stage: "close", code, reason: text || null });
+      });
+    });
+  }
+
+  return { connect, disconnect, probe, info };
 }
