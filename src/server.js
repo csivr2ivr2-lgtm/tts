@@ -7,7 +7,7 @@ process.env.MKL_NUM_THREADS ||= "1";
 process.env.OPENBLAS_NUM_THREADS ||= "1";
 process.env.ORT_NUM_THREADS ||= "1";
 
-const VERSION = "0.2.5";
+const VERSION = "0.2.6";
 const PORT = Number(process.env.PORT || 3000);
 const API_KEY = process.env.TTS_API_KEY || "";
 const LANGUAGE = process.env.TTS_LANGUAGE || "hebrew";
