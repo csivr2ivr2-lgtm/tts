@@ -1,12 +1,12 @@
-# Aharon TTS Server v0.2.3
+# Aharon TTS Server v0.2.4
 
 Node.js server-side Hebrew TTS for Hostinger Business, with a prepared custom voice profile.
 
-## Why v0.2.3 exists
+## Why v0.2.4 exists
 
 On this Hostinger Business account, loading the 177 MB TTS model and the ~39 MB voice encoder at the same time caused the Node process to restart around 60% of the encoder load.
 
-v0.2.3 keeps the v0.2.2 split between encoder and TTS, and also handles Hostinger process recycling automatically:
+v0.2.4 keeps the split between encoder and TTS, handles Hostinger process recycling automatically, and fixes Hostinger's misleading `homedir()` value so generated voice assets survive redeploys:
 
 1. **One-time voice build:** load only `encoder.onnx` + a private local `voices/ari.wav`, write a small persistent `ari.voice` profile, release the encoder.
 2. **Normal TTS:** load the TTS model + the prepared `ari.voice`. The encoder is never loaded during normal speech generation.
@@ -20,7 +20,7 @@ The profile and encoder cache are stored by default under:
 └── encoder.onnx
 ```
 
-That path is outside Hostinger's versioned `hbuilds/...` deployment directory, so process restarts do not delete the prepared voice profile.
+On Hostinger, the code now detects `/home/<user>/domains/...` and stores these files under the real account home `/home/<user>/.cache/aharon-tts/`, outside both the domain tree and versioned `hbuilds/...` directories. This makes the profile survive app restarts and redeploys.
 
 ## Deploy
 
@@ -52,7 +52,7 @@ ready
 complete
 ```
 
-If Hostinger restarts the process during the encoder **download**, run the same command again. v0.2.2 keeps `encoder.onnx.part` and resumes it with HTTP Range instead of starting from zero.
+If Hostinger restarts the process during the encoder **download**, run the same command again. The server keeps `encoder.onnx.part` and resumes it with HTTP Range instead of starting from zero.
 
 If the full encoder was already downloaded, later attempts show:
 
@@ -121,4 +121,4 @@ curl -X POST "https://tts.aharon.cloud/v1/tts" \
   --output speech.wav
 ```
 
-The personal source recording is intentionally **not committed to GitHub**. On the current Hostinger deployment, the prepared profile already exists at `~/.cache/aharon-tts/ari.voice`, so normal TTS does not need the WAV. To rebuild the profile later, place a private recording at `voices/ari.wav` (or set `TTS_VOICE_FILE`) and call `/admin/build-voice/`. A clean 15–20 second sample should improve similarity.
+The personal source recording is intentionally **not committed to GitHub**. After `/admin/build-voice/` succeeds on v0.2.4, the prepared profile is stored at the persistent account-level `~/.cache/aharon-tts/ari.voice`, so normal TTS does not need the WAV. To rebuild the profile later, place a private recording at `voices/ari.wav` (or set `TTS_VOICE_FILE`) and call `/admin/build-voice/`. A clean 15–20 second sample should improve similarity.

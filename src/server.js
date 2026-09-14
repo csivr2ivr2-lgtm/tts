@@ -7,7 +7,7 @@ process.env.MKL_NUM_THREADS ||= "1";
 process.env.OPENBLAS_NUM_THREADS ||= "1";
 process.env.ORT_NUM_THREADS ||= "1";
 
-const VERSION = "0.2.3";
+const VERSION = "0.2.4";
 const PORT = Number(process.env.PORT || 3000);
 const API_KEY = process.env.TTS_API_KEY || "";
 const LANGUAGE = process.env.TTS_LANGUAGE || "hebrew";
@@ -258,58 +258,47 @@ async function warmupHandler(_req, res) {
   res.status(200);
   res.set({
     "Content-Type": "application/x-ndjson; charset=utf-8",
-    "Cache-Control": "no-cache, no-store, must-revalidate",
-    "X-Accel-Buffering": "no"
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive"
   });
-  res.flushHeaders();
+  res.flushHeaders?.();
 
-  const writeEvent = (event) => {
-    if (res.writableEnded || res.destroyed) return;
-    res.write(`${JSON.stringify({ ok: event.stage !== "error", ...event })}\n`);
-    if (typeof res.flush === "function") res.flush();
+  const send = (payload) => {
+    if (!res.writableEnded) res.write(`${JSON.stringify({ ok: true, ...payload })}\n`);
   };
 
   console.log("[TTS] streaming warmup request opened");
-  writeEvent({ stage: "accepted", status: engineStatus, pid: process.pid });
-  await new Promise((resolve) => setImmediate(resolve));
+  send({ stage: "accepted", status: engineStatus, pid: process.pid });
 
   try {
-    await initTts(writeEvent);
-    writeEvent({ stage: "complete", ready: true, ...engineInfo });
+    await initTts(send);
+    send({ stage: "complete", ready: true, ...engineInfo });
   } catch (error) {
-    writeEvent({
-      stage: "error",
-      error: error instanceof Error ? `${error.name}: ${error.message}` : String(error)
-    });
+    const message = error instanceof Error ? error.message : String(error);
+    if (!res.writableEnded) res.write(`${JSON.stringify({ ok: false, stage: "error", error: message })}\n`);
   } finally {
     if (!res.writableEnded) res.end();
   }
 }
 
+app.post("/admin/warmup", requireAuth, warmupHandler);
+app.post("/admin/warmup/", requireAuth, warmupHandler);
+
 async function buildVoiceHandler(req, res) {
-  if (engineStatus === "loading" || engineStatus === "ready") {
-    return res.status(409).json({
-      ok: false,
-      error: "tts_model_loaded",
-      message: "Build the voice profile before warming the TTS model. Restart the app if needed."
-    });
-  }
   if (voiceBuildStatus === "building") {
-    return res.status(202).json({ ok: true, accepted: true, status: voiceBuildStatus, stage: voiceBuildStage });
+    return res.status(409).json({ ok: false, error: "voice_build_in_progress", stage: voiceBuildStage });
   }
 
   res.status(200);
   res.set({
     "Content-Type": "application/x-ndjson; charset=utf-8",
-    "Cache-Control": "no-cache, no-store, must-revalidate",
-    "X-Accel-Buffering": "no"
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive"
   });
-  res.flushHeaders();
+  res.flushHeaders?.();
 
-  const writeEvent = (event) => {
-    if (res.writableEnded || res.destroyed) return;
-    res.write(`${JSON.stringify({ ok: event.stage !== "error", ...event })}\n`);
-    if (typeof res.flush === "function") res.flush();
+  const sendRaw = (payload) => {
+    if (!res.writableEnded) res.write(`${JSON.stringify(payload)}\n`);
   };
 
   voiceBuildStatus = "building";
@@ -317,8 +306,13 @@ async function buildVoiceHandler(req, res) {
   voiceBuildError = null;
   voiceBuildInfo = {};
   console.log(`[VOICE] build request opened pid=${process.pid}`);
-  writeEvent({ stage: "accepted", pid: process.pid, profilePath: VOICE_PROFILE_FILE });
-  await new Promise((resolve) => setImmediate(resolve));
+  sendRaw({ ok: true, stage: "accepted", pid: process.pid, profilePath: VOICE_PROFILE_FILE });
+
+  const onProgress = (event) => {
+    voiceBuildStage = event.stage || voiceBuildStage;
+    console.log(`[VOICE] ${voiceBuildStage}${event.percent >= 0 ? ` ${event.percent}%` : ""}`);
+    sendRaw({ ok: true, ...event });
+  };
 
   try {
     const result = await buildVoiceProfile({
@@ -326,146 +320,123 @@ async function buildVoiceHandler(req, res) {
       voiceName: VOICE_NAME,
       profilePath: VOICE_PROFILE_FILE,
       modelsUrl: MODELS_URL,
-      force: req.query.force === "1" || req.query.force === "true",
+      force: Boolean(req.query.force === "1" || req.query.force === "true"),
       keepEncoder: KEEP_ENCODER,
-      onProgress: (event) => {
-        voiceBuildStage = event.stage;
-        const suffix = Number.isFinite(event.percent) && event.percent >= 0 ? ` ${event.percent}%` : "";
-        console.log(`[VOICE] ${event.stage}${suffix}`);
-        writeEvent(event);
-      }
+      onProgress
     });
+
     voiceBuildStatus = "ready";
-    voiceBuildStage = "ready";
+    voiceBuildStage = "profile-saved";
     voiceBuildInfo = result;
     console.log(`[VOICE] profile ready ${result.profilePath} floats=${result.floats}`);
-    writeEvent({ stage: "ready", ...result });
-    writeEvent({ stage: "complete", ready: true, next: "POST /admin/warmup/" });
+    sendRaw({ ok: true, stage: "ready", ...result });
+    sendRaw({ ok: true, stage: "complete", ready: true, next: "POST /admin/warmup/ or call POST /v1/tts directly" });
   } catch (error) {
     voiceBuildStatus = "error";
     voiceBuildStage = "error";
     voiceBuildError = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
     console.error("[VOICE] build failed:", error);
-    writeEvent({ stage: "error", error: voiceBuildError });
+    sendRaw({ ok: false, stage: "error", error: voiceBuildError });
   } finally {
     if (!res.writableEnded) res.end();
   }
 }
 
+app.post("/admin/build-voice", requireAuth, buildVoiceHandler);
+app.post("/admin/build-voice/", requireAuth, buildVoiceHandler);
+
 app.get("/admin/voice-status", requireAuth, async (_req, res) => {
   try {
     const profile = await inspectVoiceProfile(VOICE_PROFILE_FILE);
     res.json({
-      ok: voiceBuildStatus !== "error",
-      status: profile.exists ? "ready" : voiceBuildStatus,
-      stage: profile.exists ? "profile-saved" : voiceBuildStage,
+      ok: true,
+      status: voiceBuildStatus,
+      stage: voiceBuildStage,
       error: voiceBuildError || undefined,
       profilePath: VOICE_PROFILE_FILE,
       profile,
-      ...voiceBuildInfo
+      ...(voiceBuildInfo || {})
     });
   } catch (error) {
-    res.status(500).json({ ok: false, error: String(error) });
+    res.status(500).json({ ok: false, error: "voice_status_failed", message: error.message });
   }
 });
 
-app.post("/admin/build-voice", requireAuth, buildVoiceHandler);
-app.post("/admin/build-voice/", requireAuth, buildVoiceHandler);
-app.post("/admin/warmup", requireAuth, warmupHandler);
-app.post("/admin/warmup/", requireAuth, warmupHandler);
-
 app.post("/v1/tts", requireAuth, async (req, res) => {
   const text = typeof req.body?.text === "string" ? req.body.text.trim() : "";
-  if (!text) return res.status(400).json({ ok: false, error: "text is required" });
+  if (!text) return res.status(400).json({ ok: false, error: "text_required" });
   if (text.length > MAX_TEXT_LENGTH) {
-    return res.status(413).json({ ok: false, error: `text is too long; max ${MAX_TEXT_LENGTH} characters` });
+    return res.status(400).json({ ok: false, error: "text_too_long", max: MAX_TEXT_LENGTH });
   }
 
-  if (engineStatus !== "ready") {
-    console.log(`[TTS] /v1/tts cold start status=${engineStatus} stage=${engineStage} pid=${process.pid}`);
-    try {
+  try {
+    if (engineStatus !== "ready" || !pipeline) {
+      console.log(`[TTS] /v1/tts cold start status=${engineStatus} stage=${engineStage} pid=${process.pid}`);
       await initTts();
-    } catch (error) {
-      return res.status(503).json({
-        ok: false,
-        error: "tts_unavailable",
-        status: engineStatus,
-        stage: engineStage,
-        message: error instanceof Error ? `${error.name}: ${error.message}` : String(error)
-      });
     }
-  }
 
-  const requestedVoice = typeof req.body?.voice === "string" ? req.body.voice.trim() : "";
-  const temperature = Number.isFinite(req.body?.temperature) ? Number(req.body.temperature) : undefined;
-  const decodeSteps = Number.isInteger(req.body?.decodeSteps) ? Number(req.body.decodeSteps) : undefined;
-  const seed = Number.isInteger(req.body?.seed) ? Number(req.body.seed) : undefined;
+    const requestedVoice = typeof req.body.voice === "string" ? req.body.voice : undefined;
+    const temperature = Number.isFinite(req.body?.temperature) ? Number(req.body.temperature) : undefined;
+    const decodeSteps = Number.isFinite(req.body?.decodeSteps) ? Number(req.body.decodeSteps) : undefined;
+    const seed = Number.isFinite(req.body?.seed) ? Number(req.body.seed) : undefined;
+    const voice = resolveVoice(requestedVoice);
 
-  let resolvedVoice;
-  try {
-    resolvedVoice = resolveVoice(requestedVoice || undefined);
-  } catch (error) {
-    return res.status(400).json({ ok: false, error: "unknown_voice", message: error.message });
-  }
+    const key = cacheKey({ text, voiceName: voice.name, temperature, decodeSteps, seed });
+    const cached = cacheGet(key);
+    if (cached) {
+      res.set({ "Content-Type": "audio/wav", "X-TTS-Cache": "HIT", "X-TTS-Voice": voice.name });
+      return res.send(cached);
+    }
 
-  const key = cacheKey({ text, voiceName: resolvedVoice.name, temperature, decodeSteps, seed });
-  const cached = cacheGet(key);
-  if (cached) {
-    res.set({
-      "Content-Type": "audio/wav",
-      "Content-Length": String(cached.length),
-      "Content-Disposition": "inline; filename=\"speech.wav\"",
-      "Cache-Control": "no-store",
-      "X-TTS-Cache": "HIT",
-      "X-TTS-Voice": resolvedVoice.name
-    });
-    return res.end(cached);
-  }
-
-  try {
     const wav = await enqueue(async () => {
-      const options = { voice: resolvedVoice.value };
-      if (temperature !== undefined) options.temperature = temperature;
-      if (decodeSteps !== undefined) options.decodeSteps = decodeSteps;
-      if (seed !== undefined) options.seed = seed;
-
-      const samples = await pipeline.speak(text, options);
-      const encoded = encodeWav(samples, pipeline.sampleRate);
-      return Buffer.from(encoded);
+      const audio = await pipeline.speak(text, {
+        voice: voice.value,
+        temperature,
+        decodeSteps,
+        seed
+      });
+      const encoded = encodeWav(audio, pipeline.sampleRate);
+      return Buffer.from(encoded.buffer, encoded.byteOffset, encoded.byteLength);
     });
 
     cacheSet(key, wav);
     res.set({
       "Content-Type": "audio/wav",
       "Content-Length": String(wav.length),
-      "Content-Disposition": "inline; filename=\"speech.wav\"",
       "Cache-Control": "no-store",
       "X-TTS-Cache": "MISS",
-      "X-TTS-Voice": resolvedVoice.name
+      "X-TTS-Voice": voice.name,
+      "X-TTS-Sample-Rate": String(pipeline.sampleRate)
     });
-    return res.end(wav);
+    return res.send(wav);
   } catch (error) {
-    console.error("[TTS] generation failed:", error);
-    return res.status(500).json({
+    const message = error instanceof Error ? error.message : String(error);
+    const status = error?.code === "UNKNOWN_VOICE" ? 400 : error?.code === "VOICE_PROFILE_MISSING" ? 503 : 500;
+    return res.status(status).json({
       ok: false,
-      error: "tts_generation_failed",
-      message: error instanceof Error ? `${error.name}: ${error.message}` : String(error)
+      error: status === 503 ? "voice_profile_missing" : "tts_failed",
+      status: engineStatus,
+      stage: engineStage,
+      message
     });
   }
 });
 
 app.use((err, _req, res, _next) => {
-  console.error(err);
-  if (err?.type === "entity.parse.failed") {
-    return res.status(400).json({ ok: false, error: "invalid_json" });
-  }
-  return res.status(500).json({ ok: false, error: "internal_server_error" });
+  console.error("[HTTP]", err);
+  if (err instanceof SyntaxError) return res.status(400).json({ ok: false, error: "invalid_json" });
+  res.status(500).json({ ok: false, error: "internal_error" });
 });
 
-app.listen(PORT, "0.0.0.0", () => {
+const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`Aharon TTS v${VERSION} listening on 0.0.0.0:${PORT}`);
   console.log(`Language: ${LANGUAGE}`);
   console.log(`Configured custom voice: ${VOICE_NAME} (${VOICE_FILE})`);
   console.log(`Prepared voice profile: ${VOICE_PROFILE_FILE}`);
   console.log("First run: POST /admin/build-voice/ once. /v1/tts auto-loads the TTS model on cold processes.");
+});
+
+server.on("error", (error) => {
+  console.error("Server error:", error);
+  process.exitCode = 1;
 });

@@ -14,12 +14,30 @@ function withSlash(value) {
   return value.endsWith("/") ? value : `${value}/`;
 }
 
+function persistentStorageDir() {
+  const override = String(process.env.TTS_PERSIST_DIR || "").trim();
+  if (override) return path.resolve(override);
+
+  // Hostinger managed Node apps may report HOME/homedir() inside the domain
+  // deployment tree (for example /home/u123/domains/example.com). That tree
+  // is replaced on every deploy. Infer the real account home from cwd/HOME
+  // and keep generated voice assets one level above /domains instead.
+  const candidates = [process.cwd(), process.env.HOME, homedir()].filter(Boolean);
+  for (const candidate of candidates) {
+    const normalized = path.resolve(String(candidate));
+    const match = normalized.match(/^(\/home\/[^/]+)(?:\/|$)/);
+    if (match) return path.join(match[1], ".cache", "aharon-tts");
+  }
+
+  return path.join(homedir(), ".cache", "aharon-tts");
+}
+
 export function defaultProfilePath(voiceName = "ari") {
-  return path.join(homedir(), ".cache", "aharon-tts", `${voiceName}.voice`);
+  return path.join(persistentStorageDir(), `${voiceName}.voice`);
 }
 
 export function defaultEncoderPath() {
-  return path.join(homedir(), ".cache", "aharon-tts", "encoder.onnx");
+  return path.join(persistentStorageDir(), "encoder.onnx");
 }
 
 async function exists(filePath) {
