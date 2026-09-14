@@ -1,7 +1,6 @@
 import path from "node:path";
 import { homedir } from "node:os";
 import { mkdir } from "node:fs/promises";
-import { WaveFile } from "wavefile";
 
 const TARGET_SAMPLE_RATE = 16000;
 
@@ -17,65 +16,174 @@ function persistentRoot() {
   return path.join(homedir(), ".cache", "aharon-tts");
 }
 
-function pcm16leToInt16(buffer) {
-  if (buffer.length % 2 !== 0) throw new Error("PCM16 payload must contain an even number of bytes");
-  const out = new Int16Array(buffer.length / 2);
-  for (let i = 0, j = 0; i < buffer.length; i += 2, j += 1) out[j] = buffer.readInt16LE(i);
-  return out;
+function clampSample(value) {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(-1, Math.min(1, value));
 }
 
-function mergeChannels(samples) {
-  if (!Array.isArray(samples)) return samples instanceof Float32Array ? samples : new Float32Array(samples);
-  if (samples.length === 1) return new Float32Array(samples[0]);
-  const length = Math.min(...samples.map((x) => x.length));
-  const mono = new Float32Array(length);
-  for (const channel of samples) {
-    for (let i = 0; i < length; i += 1) mono[i] += channel[i] / samples.length;
+function muLawToFloat(byte) {
+  let value = (~byte) & 0xff;
+  const sign = value & 0x80;
+  const exponent = (value >> 4) & 0x07;
+  const mantissa = value & 0x0f;
+  let sample = ((mantissa << 3) + 0x84) << exponent;
+  sample -= 0x84;
+  if (sign) sample = -sample;
+  return clampSample(sample / 32768);
+}
+
+function aLawToFloat(byte) {
+  let value = (byte ^ 0x55) & 0xff;
+  let sample = (value & 0x0f) << 4;
+  const segment = (value & 0x70) >> 4;
+  if (segment === 0) sample += 8;
+  else if (segment === 1) sample += 0x108;
+  else {
+    sample += 0x108;
+    sample <<= segment - 1;
   }
-  return mono;
+  if ((value & 0x80) === 0) sample = -sample;
+  return clampSample(sample / 32768);
 }
 
-function normalizeWaveTo16k(wav) {
-  if (wav.bitDepth === "8m") wav.fromMuLaw("16");
-  if (wav.bitDepth === "8a") wav.fromALaw("16");
-  if (wav.bitDepth === "4") wav.fromIMAADPCM("16");
-  wav.toBitDepth("32f");
-  if (Number(wav.fmt.sampleRate) !== TARGET_SAMPLE_RATE) wav.toSampleRate(TARGET_SAMPLE_RATE);
-  const mono = mergeChannels(wav.getSamples());
-  return { samples: mono, sourceSampleRate: Number(wav.fmt.sampleRate || TARGET_SAMPLE_RATE) };
+function decodeRaw(buffer, encoding) {
+  const normalized = String(encoding || "").toLowerCase();
+  if (["s16le", "pcm16", "pcm_s16le"].includes(normalized)) {
+    if (buffer.length % 2) throw new Error("PCM16 payload must contain an even number of bytes");
+    const samples = new Float32Array(buffer.length / 2);
+    for (let i = 0, j = 0; i < buffer.length; i += 2, j += 1) samples[j] = buffer.readInt16LE(i) / 32768;
+    return samples;
+  }
+  if (["mulaw", "mu-law", "ulaw", "pcmu"].includes(normalized)) {
+    const samples = new Float32Array(buffer.length);
+    for (let i = 0; i < buffer.length; i += 1) samples[i] = muLawToFloat(buffer[i]);
+    return samples;
+  }
+  if (["alaw", "a-law", "pcma"].includes(normalized)) {
+    const samples = new Float32Array(buffer.length);
+    for (let i = 0; i < buffer.length; i += 1) samples[i] = aLawToFloat(buffer[i]);
+    return samples;
+  }
+  throw new Error(`Unsupported audio encoding '${encoding}'`);
+}
+
+function readPcmSample(buffer, offset, bitsPerSample, formatTag) {
+  if (formatTag === 3) {
+    if (bitsPerSample === 32) return clampSample(buffer.readFloatLE(offset));
+    if (bitsPerSample === 64) return clampSample(buffer.readDoubleLE(offset));
+    throw new Error(`Unsupported IEEE-float WAV bit depth ${bitsPerSample}`);
+  }
+  if (formatTag !== 1) throw new Error(`Unsupported WAV format tag ${formatTag}`);
+  if (bitsPerSample === 8) return (buffer.readUInt8(offset) - 128) / 128;
+  if (bitsPerSample === 16) return buffer.readInt16LE(offset) / 32768;
+  if (bitsPerSample === 24) {
+    let value = buffer.readUIntLE(offset, 3);
+    if (value & 0x800000) value -= 0x1000000;
+    return value / 8388608;
+  }
+  if (bitsPerSample === 32) return buffer.readInt32LE(offset) / 2147483648;
+  throw new Error(`Unsupported PCM WAV bit depth ${bitsPerSample}`);
+}
+
+function parseWav(buffer) {
+  if (buffer.length < 44 || buffer.subarray(0, 4).toString("ascii") !== "RIFF" || buffer.subarray(8, 12).toString("ascii") !== "WAVE") {
+    throw new Error("Invalid WAV/RIFF header");
+  }
+  let fmt = null;
+  let data = null;
+  let offset = 12;
+  while (offset + 8 <= buffer.length) {
+    const id = buffer.subarray(offset, offset + 4).toString("ascii");
+    const size = buffer.readUInt32LE(offset + 4);
+    const start = offset + 8;
+    const end = start + size;
+    if (end > buffer.length) throw new Error(`Corrupt WAV chunk '${id}'`);
+    if (id === "fmt ") {
+      if (size < 16) throw new Error("Invalid WAV fmt chunk");
+      fmt = {
+        formatTag: buffer.readUInt16LE(start),
+        channels: buffer.readUInt16LE(start + 2),
+        sampleRate: buffer.readUInt32LE(start + 4),
+        blockAlign: buffer.readUInt16LE(start + 12),
+        bitsPerSample: buffer.readUInt16LE(start + 14)
+      };
+      if (fmt.formatTag === 0xfffe && size >= 40) fmt.formatTag = buffer.readUInt16LE(start + 24);
+    } else if (id === "data") {
+      data = buffer.subarray(start, end);
+    }
+    offset = end + (size & 1);
+  }
+  if (!fmt || !data) throw new Error("WAV is missing fmt or data chunk");
+  if (!fmt.channels || fmt.channels > 8) throw new Error(`Unsupported WAV channel count ${fmt.channels}`);
+  if (!fmt.sampleRate || fmt.sampleRate < 4000 || fmt.sampleRate > 192000) throw new Error("Invalid WAV sample rate");
+
+  if (fmt.formatTag === 6 || fmt.formatTag === 7) {
+    const bytesPerFrame = fmt.channels;
+    const frames = Math.floor(data.length / bytesPerFrame);
+    const mono = new Float32Array(frames);
+    for (let frame = 0; frame < frames; frame += 1) {
+      let sum = 0;
+      for (let channel = 0; channel < fmt.channels; channel += 1) {
+        const byte = data[frame * bytesPerFrame + channel];
+        sum += fmt.formatTag === 7 ? muLawToFloat(byte) : aLawToFloat(byte);
+      }
+      mono[frame] = sum / fmt.channels;
+    }
+    return { samples: mono, sampleRate: fmt.sampleRate };
+  }
+
+  const bytesPerSample = fmt.bitsPerSample / 8;
+  if (!Number.isInteger(bytesPerSample) || bytesPerSample <= 0) throw new Error("Invalid WAV bit depth");
+  const blockAlign = fmt.blockAlign || bytesPerSample * fmt.channels;
+  const frames = Math.floor(data.length / blockAlign);
+  const mono = new Float32Array(frames);
+  for (let frame = 0; frame < frames; frame += 1) {
+    let sum = 0;
+    const frameOffset = frame * blockAlign;
+    for (let channel = 0; channel < fmt.channels; channel += 1) {
+      sum += readPcmSample(data, frameOffset + channel * bytesPerSample, fmt.bitsPerSample, fmt.formatTag);
+    }
+    mono[frame] = clampSample(sum / fmt.channels);
+  }
+  return { samples: mono, sampleRate: fmt.sampleRate };
+}
+
+function resampleLinear(samples, sourceRate, targetRate = TARGET_SAMPLE_RATE) {
+  if (sourceRate === targetRate) return samples instanceof Float32Array ? samples : new Float32Array(samples);
+  if (!samples.length) return new Float32Array(0);
+  const outLength = Math.max(1, Math.round(samples.length * targetRate / sourceRate));
+  const out = new Float32Array(outLength);
+  const ratio = sourceRate / targetRate;
+  for (let i = 0; i < outLength; i += 1) {
+    const pos = i * ratio;
+    const left = Math.min(samples.length - 1, Math.floor(pos));
+    const right = Math.min(samples.length - 1, left + 1);
+    const frac = pos - left;
+    out[i] = samples[left] + (samples[right] - samples[left]) * frac;
+  }
+  return out;
 }
 
 export function decodeSttAudio(buffer, { encoding = "wav", sampleRate = 8000 } = {}) {
   if (!Buffer.isBuffer(buffer) || buffer.length === 0) throw new Error("Audio body is empty");
   const normalizedEncoding = String(encoding || "wav").toLowerCase();
-  const sourceRate = Number(sampleRate || 8000);
-  if (!Number.isFinite(sourceRate) || sourceRate < 4000 || sourceRate > 192000) throw new Error("Invalid sample_rate");
-
-  let wav;
+  let sourceRate;
+  let sourceSamples;
   if (normalizedEncoding === "wav" || buffer.subarray(0, 4).toString("ascii") === "RIFF") {
-    wav = new WaveFile(buffer);
-  } else if (["s16le", "pcm16", "pcm_s16le"].includes(normalizedEncoding)) {
-    wav = new WaveFile();
-    wav.fromScratch(1, sourceRate, "16", pcm16leToInt16(buffer));
-  } else if (["mulaw", "mu-law", "ulaw", "pcmu"].includes(normalizedEncoding)) {
-    wav = new WaveFile();
-    wav.fromScratch(1, sourceRate, "8m", new Uint8Array(buffer));
-    wav.fromMuLaw("16");
-  } else if (["alaw", "a-law", "pcma"].includes(normalizedEncoding)) {
-    wav = new WaveFile();
-    wav.fromScratch(1, sourceRate, "8a", new Uint8Array(buffer));
-    wav.fromALaw("16");
+    const wav = parseWav(buffer);
+    sourceRate = wav.sampleRate;
+    sourceSamples = wav.samples;
   } else {
-    throw new Error(`Unsupported audio encoding '${encoding}'`);
+    sourceRate = Number(sampleRate || 8000);
+    if (!Number.isFinite(sourceRate) || sourceRate < 4000 || sourceRate > 192000) throw new Error("Invalid sample_rate");
+    sourceSamples = decodeRaw(buffer, normalizedEncoding);
   }
-
-  const originalRate = Number(wav.fmt.sampleRate || sourceRate);
-  const result = normalizeWaveTo16k(wav);
+  const samples = resampleLinear(sourceSamples, sourceRate, TARGET_SAMPLE_RATE);
   return {
-    samples: result.samples,
+    samples,
     sampleRate: TARGET_SAMPLE_RATE,
-    sourceSampleRate: originalRate,
-    durationSec: result.samples.length / TARGET_SAMPLE_RATE
+    sourceSampleRate: sourceRate,
+    durationSec: samples.length / TARGET_SAMPLE_RATE
   };
 }
 
@@ -85,7 +193,6 @@ export function createSttEngine(options = {}) {
   const language = options.language || process.env.STT_LANGUAGE || "hebrew";
   const idleUnloadMs = Number(options.idleUnloadMs ?? process.env.STT_IDLE_UNLOAD_MS ?? 60000);
   const cacheDir = path.resolve(options.cacheDir || process.env.STT_CACHE_DIR || path.join(persistentRoot(), "whisper"));
-
   let pipe = null;
   let loading = null;
   let status = "idle";
@@ -93,7 +200,6 @@ export function createSttEngine(options = {}) {
   let error = null;
   let unloadTimer = null;
   let lastUsedAt = null;
-
   const emit = (onEvent, event) => onEvent?.(event);
 
   function scheduleUnload() {
@@ -112,7 +218,6 @@ export function createSttEngine(options = {}) {
     error = null;
     console.log(`[STT] load starting model=${model} dtype=${dtype} pid=${process.pid}`);
     emit(onEvent, { stage: "load-start", model, dtype, cacheDir, pid: process.pid });
-
     loading = (async () => {
       try {
         await mkdir(cacheDir, { recursive: true });
@@ -201,6 +306,5 @@ export function createSttEngine(options = {}) {
   function info() {
     return { status, stage, error, model, dtype, language, sampleRate: TARGET_SAMPLE_RATE, cacheDir, loaded: Boolean(pipe), idleUnloadMs, lastUsedAt };
   }
-
   return { load, transcribe, unload, info };
 }
