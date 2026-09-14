@@ -1,6 +1,6 @@
 {
   "name": "aharon-tts-server",
-  "version": "0.3.3",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -8,7 +8,7 @@
   },
   "scripts": {
     "start": "node src/start.js",
-    "check": "node --check src/start.js && node --check src/server.js && node --check src/audio.js && node --check src/voice-profile.js && node --check src/stt.js"
+    "check": "node --check src/start.js && node --check src/server.js && node --check src/audio.js && node --check src/voice-profile.js && node --check src/stt.js && node --check src/telephony.js"
   },
   "dependencies": {
     "express": "^5.1.0",

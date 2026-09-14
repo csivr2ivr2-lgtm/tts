@@ -1,10 +1,11 @@
 import express from "express";
 import crypto from "node:crypto";
 import { defaultProfilePath, buildVoiceProfile, inspectVoiceProfile, loadVoiceProfile } from "./voice-profile.js";
+import { encodeTelephony } from "./telephony.js";
 
 for (const k of ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "ORT_NUM_THREADS"]) process.env[k] ||= "1";
 
-const VERSION = "0.3.3";
+const VERSION = "0.4.0";
 const PORT = Number(process.env.PORT || 3000);
 const API_KEY = process.env.TTS_API_KEY || "";
 const LANGUAGE = process.env.TTS_LANGUAGE || "hebrew";
@@ -18,6 +19,8 @@ const MAX_TEXT_LENGTH = Number(process.env.TTS_MAX_TEXT_LENGTH || 1200);
 const CACHE_MAX_ITEMS = Number(process.env.TTS_CACHE_MAX_ITEMS || 100);
 const STT_MAX_AUDIO_BYTES = Number(process.env.STT_MAX_AUDIO_BYTES || 8 * 1024 * 1024);
 const STT_MAX_AUDIO_SECONDS = Number(process.env.STT_MAX_AUDIO_SECONDS || 120);
+const TELEPHONY_CODEC = String(process.env.TELEPHONY_CODEC || "pcmu").toLowerCase();
+const TELEPHONY_SAMPLE_RATE = Number(process.env.TELEPHONY_SAMPLE_RATE || 8000);
 
 const app = express();
 app.disable("x-powered-by");
@@ -252,7 +255,13 @@ app.post("/v1/stt", auth, rawAudio, async (req, res) => {
   try {
     ({ stt: engine, mod } = await ensureStt());
     const type = (req.get("content-type") || "").split(";")[0].toLowerCase();
-    audio = mod.decodeSttAudio(req.body, { encoding: type.includes("wav") ? "wav" : String(req.query.encoding || "s16le"), sampleRate: Number(req.query.sample_rate || 8000) });
+    audio = mod.decodeSttAudio(req.body, { encoding: type.includes("wav") ? "wav" : String(req.query.encoding || "s16le"), sampleRate: Number(req.query.sample_rate || TELEPHONY_SAMPLE_RATE) });
+    const simulateCodec = String(req.query.simulate_telephony || "").toLowerCase();
+    if (simulateCodec) {
+      const encoded = encodeTelephony(audio.samples, audio.sampleRate, simulateCodec, TELEPHONY_SAMPLE_RATE);
+      audio = mod.decodeSttAudio(encoded, { encoding: simulateCodec, sampleRate: TELEPHONY_SAMPLE_RATE });
+      audio.simulatedTelephony = { codec: simulateCodec, sampleRate: TELEPHONY_SAMPLE_RATE, bytes: encoded.length };
+    }
   } catch (e) {
     const message = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
     const importFailure = Boolean(sttImportError);
@@ -261,7 +270,7 @@ app.post("/v1/stt", auth, rawAudio, async (req, res) => {
   if (audio.durationSec > STT_MAX_AUDIO_SECONDS) return res.status(413).json({ ok: false, error: "audio_too_long", maxSeconds: STT_MAX_AUDIO_SECONDS });
   try {
     const result = await enqueue(() => engine.transcribe(audio.samples, { language: String(req.query.language || process.env.STT_LANGUAGE || "hebrew"), timestamps: req.query.timestamps !== "0" && req.query.timestamps !== "false" }));
-    res.json({ ok: true, text: result.text, chunks: result.chunks, language: String(req.query.language || process.env.STT_LANGUAGE || "hebrew"), model: engine.info().model, durationSec: Number(audio.durationSec.toFixed(3)), sourceSampleRate: audio.sourceSampleRate, sampleRate: audio.sampleRate, processingMs: result.processingMs });
+    res.json({ ok: true, text: result.text, chunks: result.chunks, language: String(req.query.language || process.env.STT_LANGUAGE || "hebrew"), model: engine.info().model, durationSec: Number(audio.durationSec.toFixed(3)), sourceSampleRate: audio.sourceSampleRate, sampleRate: audio.sampleRate, simulatedTelephony: audio.simulatedTelephony, processingMs: result.processingMs });
   } catch (e) { res.status(500).json({ ok: false, error: "stt_failed", message: e instanceof Error ? `${e.name}: ${e.message}` : String(e), stt: sttInfo() }); }
 });
 
@@ -277,19 +286,40 @@ app.post("/v1/tts", auth, async (req, res) => {
   const temperature = Number.isFinite(req.body?.temperature) ? Number(req.body.temperature) : undefined;
   const decodeSteps = Number.isInteger(req.body?.decodeSteps) ? Number(req.body.decodeSteps) : undefined;
   const seed = Number.isInteger(req.body?.seed) ? Number(req.body.seed) : undefined;
-  const key = crypto.createHash("sha256").update(JSON.stringify({ text, voice: voice.name, temperature, decodeSteps, seed, LANGUAGE, VERSION })).digest("hex");
+  const format = String(req.body?.format || "wav").toLowerCase();
+  const outputRate = Number(req.body?.sampleRate || (format === "wav" ? tts.sampleRate : TELEPHONY_SAMPLE_RATE));
+  if (!["wav", "pcmu", "mulaw", "ulaw", "pcma", "alaw"].includes(format)) {
+    return res.status(400).json({ ok: false, error: "unsupported_output_format", formats: ["wav", "pcmu", "pcma"] });
+  }
+  if (format !== "wav" && outputRate !== 8000 && outputRate !== 16000) {
+    return res.status(400).json({ ok: false, error: "unsupported_telephony_sample_rate", sampleRates: [8000, 16000] });
+  }
+  const normalizedFormat = ["mulaw", "ulaw"].includes(format) ? "pcmu" : (format === "alaw" ? "pcma" : format);
+  const key = crypto.createHash("sha256").update(JSON.stringify({ text, voice: voice.name, temperature, decodeSteps, seed, format: normalizedFormat, outputRate, LANGUAGE, VERSION })).digest("hex");
   const hit = wavCache.get(key);
-  if (hit) return res.set({ "Content-Type": "audio/wav", "Content-Length": String(hit.length), "X-TTS-Cache": "HIT", "X-TTS-Voice": voice.name }).end(hit);
+  const headersFor = (buffer, cacheState) => ({
+    "Content-Type": normalizedFormat === "wav" ? "audio/wav" : "application/octet-stream",
+    "Content-Length": String(buffer.length),
+    "Content-Disposition": normalizedFormat === "wav" ? 'inline; filename="speech.wav"' : `inline; filename="speech.${normalizedFormat}"`,
+    "Cache-Control": "no-store",
+    "X-TTS-Cache": cacheState,
+    "X-TTS-Voice": voice.name,
+    "X-Audio-Codec": normalizedFormat,
+    "X-Audio-Sample-Rate": String(normalizedFormat === "wav" ? tts.sampleRate : outputRate)
+  });
+  if (hit) return res.set(headersFor(hit, "HIT")).end(hit);
   try {
-    const wav = await enqueue(async () => {
+    const audio = await enqueue(async () => {
       const options = { voice: voice.value };
       if (temperature !== undefined) options.temperature = temperature;
       if (decodeSteps !== undefined) options.decodeSteps = decodeSteps;
       if (seed !== undefined) options.seed = seed;
-      return Buffer.from(encodeWav(await tts.speak(text, options), tts.sampleRate));
+      const samples = await tts.speak(text, options);
+      if (normalizedFormat === "wav") return Buffer.from(encodeWav(samples, tts.sampleRate));
+      return encodeTelephony(samples, tts.sampleRate, normalizedFormat, outputRate);
     });
-    cacheSet(key, wav);
-    res.set({ "Content-Type": "audio/wav", "Content-Length": String(wav.length), "Content-Disposition": "inline; filename=\"speech.wav\"", "Cache-Control": "no-store", "X-TTS-Cache": "MISS", "X-TTS-Voice": voice.name }).end(wav);
+    cacheSet(key, audio);
+    res.set(headersFor(audio, "MISS")).end(audio);
   } catch (e) { res.status(500).json({ ok: false, error: "tts_generation_failed", message: e instanceof Error ? `${e.name}: ${e.message}` : String(e) }); }
 });
 
