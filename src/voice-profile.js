@@ -194,40 +194,81 @@ export async function buildVoiceProfile({
   onProgress?.({ stage: "voice-decode", sampleRate });
   let resolvedVoiceFile = path.resolve(process.cwd(), voiceFile);
   let removeBootstrapVoice = false;
+  let decoded = null;
 
   if (!(await exists(resolvedVoiceFile))) {
-    const bootstrapB64 = `${resolvedVoiceFile}.gz.b64`;
-    let encoded = "";
+    const dir = path.dirname(resolvedVoiceFile);
+    const baseName = path.basename(resolvedVoiceFile);
 
-    if (await exists(bootstrapB64)) {
-      encoded = (await readFile(bootstrapB64, "utf8")).trim();
-    } else {
-      const dir = path.dirname(resolvedVoiceFile);
-      const prefix = `${path.basename(resolvedVoiceFile)}.gz.b64.part`;
+    const readBootstrapText = async (singleSuffix, partPrefix) => {
+      const single = `${resolvedVoiceFile}${singleSuffix}`;
+      if (await exists(single)) return (await readFile(single, "utf8")).trim();
+
       let parts = [];
       try {
-        parts = (await readdir(dir)).filter((name) => name.startsWith(prefix)).sort();
+        parts = (await readdir(dir)).filter((name) => name.startsWith(`${baseName}${partPrefix}`)).sort();
       } catch {
         parts = [];
       }
-      if (parts.length) {
-        encoded = (await Promise.all(parts.map((name) => readFile(path.join(dir, name), "utf8"))))
-          .join("")
-          .trim();
-      }
-    }
+      if (!parts.length) return "";
+      return (await Promise.all(parts.map((name) => readFile(path.join(dir, name), "utf8"))))
+        .join("")
+        .trim();
+    };
 
-    if (encoded) {
-      const bytes = gunzipSync(Buffer.from(encoded, "base64"));
+    const encodedGzip = await readBootstrapText(".gz.b64", ".gz.b64.part");
+    if (encodedGzip) {
+      const bytes = gunzipSync(Buffer.from(encodedGzip, "base64"));
       resolvedVoiceFile = path.join(path.dirname(profilePath), `${voiceName}.bootstrap.wav`);
       await mkdir(path.dirname(resolvedVoiceFile), { recursive: true });
       await writeFile(resolvedVoiceFile, bytes);
       removeBootstrapVoice = true;
-      onProgress?.({ stage: "voice-bootstrap-decoded", bytes: bytes.length, voiceFile: resolvedVoiceFile });
+      onProgress?.({ stage: "voice-bootstrap-decoded", format: "wav-gzip", bytes: bytes.length, voiceFile: resolvedVoiceFile });
+    } else {
+      const encodedOpus = await readBootstrapText(".opus.b64", ".opus.b64.part");
+      if (encodedOpus) {
+        const oggBytes = Buffer.from(encodedOpus, "base64");
+        const { OggOpusDecoder } = await import("ogg-opus-decoder");
+        const decoder = new OggOpusDecoder({ sampleRate });
+        try {
+          await decoder.ready;
+          const result = await decoder.decodeFile(new Uint8Array(oggBytes));
+          if (!result?.channelData?.length || !result.samplesDecoded) {
+            throw new Error("Ogg Opus bootstrap decoded no audio samples");
+          }
+
+          let samples;
+          if (result.channelData.length === 1) {
+            samples = new Float32Array(result.channelData[0]);
+          } else {
+            samples = new Float32Array(result.samplesDecoded);
+            for (const channel of result.channelData) {
+              for (let i = 0; i < samples.length; i += 1) samples[i] += channel[i] / result.channelData.length;
+            }
+          }
+
+          decoded = {
+            samples,
+            sourceSampleRate: Number(result.sampleRate || sampleRate),
+            durationSec: samples.length / Number(result.sampleRate || sampleRate)
+          };
+          onProgress?.({
+            stage: "voice-bootstrap-decoded",
+            format: "ogg-opus",
+            bytes: oggBytes.length,
+            samples: samples.length,
+            sampleRate: decoded.sourceSampleRate,
+            durationSec: decoded.durationSec,
+            decodeErrors: Array.isArray(result.errors) ? result.errors.length : 0
+          });
+        } finally {
+          decoder.free();
+        }
+      }
     }
   }
 
-  const decoded = await loadMonoWav(resolvedVoiceFile, sampleRate);
+  if (!decoded) decoded = await loadMonoWav(resolvedVoiceFile, sampleRate);
   if (decoded.durationSec < 2) throw new Error("Custom voice sample must be at least 2 seconds");
   const audio = padAudio(decoded.samples, frameSize);
   onProgress?.({
