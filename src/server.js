@@ -6,7 +6,7 @@ import { createSipController } from "./sip.js";
 
 for (const k of ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "ORT_NUM_THREADS"]) process.env[k] ||= "1";
 
-const VERSION = "0.5.1";
+const VERSION = "0.5.2";
 const PORT = Number(process.env.PORT || 3000);
 const API_KEY = process.env.TTS_API_KEY || "";
 const LANGUAGE = process.env.TTS_LANGUAGE || "hebrew";
@@ -22,12 +22,12 @@ const STT_MAX_AUDIO_BYTES = Number(process.env.STT_MAX_AUDIO_BYTES || 8 * 1024 *
 const STT_MAX_AUDIO_SECONDS = Number(process.env.STT_MAX_AUDIO_SECONDS || 120);
 const TELEPHONY_CODEC = String(process.env.TELEPHONY_CODEC || "pcmu").toLowerCase();
 const TELEPHONY_SAMPLE_RATE = Number(process.env.TELEPHONY_SAMPLE_RATE || 8000);
+const sip = createSipController();
 
 const app = express();
 app.disable("x-powered-by");
 app.use(express.json({ limit: "64kb" }));
 
-const sip = createSipController();
 let tts = null;
 let encodeWav = null;
 let ttsLoadPromise = null;
@@ -259,6 +259,14 @@ app.post("/admin/sip/probe", auth, async (_req, res) => {
     res.status(500).json({ ok: false, error: "sip_probe_failed", message: e instanceof Error ? e.message : String(e), sip: sip.info() });
   }
 });
+app.post("/admin/sip/diagnostics", auth, async (_req, res) => {
+  try {
+    const result = await sip.diagnoseTransport();
+    res.status(result.ok ? 200 : 502).json(result);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: "sip_diagnostics_failed", message: e instanceof Error ? e.message : String(e), sip: sip.info() });
+  }
+});
 app.post("/admin/sip/connect", auth, async (_req, res) => {
   try {
     const state = await sip.connect();
@@ -360,7 +368,6 @@ app.listen(PORT, "0.0.0.0", () => {
   const si = sttInfo();
   console.log(`TTS=${LANGUAGE}/${VOICE_NAME}; STT=${si.model}/${si.dtype}/${si.language} (lazy)`);
   console.log(`Voice profile: ${VOICE_PROFILE_FILE}`);
-  console.log(`Telephony=${TELEPHONY_CODEC}/${TELEPHONY_SAMPLE_RATE}Hz; SIP=${sip.info().configured ? "configured" : "disabled"}`);
   if (sip.info().autoConnect && sip.info().configured) {
     sip.connect().catch((error) => console.error("[SIP] auto-connect failed:", error instanceof Error ? error.message : String(error)));
   }
