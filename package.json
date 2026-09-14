@@ -7,12 +7,13 @@
     "node": ">=20"
   },
   "scripts": {
-    "start": "node src/server.js",
-    "check": "node --check src/server.js && node --check src/audio.js && node --check src/voice-profile.js"
+    "start": "node src/bootstrap-server.js",
+    "check": "node --check src/bootstrap-server.js && node --check src/server.js && node --check src/audio.js && node --check src/voice-profile.js"
   },
   "dependencies": {
     "express": "^5.1.0",
     "pocket-tts-onnx": "^0.1.0",
-    "onnxruntime-node": "^1.29.0"
+    "onnxruntime-node": "^1.29.0",
+    "ogg-opus-decoder": "^1.7.5"
   }
 }
