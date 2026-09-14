@@ -1,6 +1,6 @@
 {
   "name": "aharon-tts-server",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "type": "module",
   "engines": {
@@ -15,7 +15,9 @@
     "pocket-tts-onnx": "^0.1.0",
     "onnxruntime-node": "^1.29.0",
     "ogg-opus-decoder": "^1.7.5",
-    "@huggingface/transformers": "^3.8.1",
-    "wavefile": "^11.0.0"
+    "@huggingface/transformers": "^3.8.1"
+  },
+  "overrides": {
+    "sharp": "0.35.4"
   }
 }
