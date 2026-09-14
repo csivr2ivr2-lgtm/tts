@@ -1,39 +1,81 @@
-# Aharon TTS Server v0.2.4
+# Aharon Voice AI v0.3.0
 
-Node.js server-side Hebrew TTS for Hostinger Business, with a prepared custom voice profile.
+Local Hebrew voice backend for Hostinger Business, running entirely in Node.js 20+:
 
-## Why v0.2.4 exists
-
-On this Hostinger Business account, loading the 177 MB TTS model and the ~39 MB voice encoder at the same time caused the Node process to restart around 60% of the encoder load.
-
-v0.2.4 keeps the split between encoder and TTS, handles Hostinger process recycling automatically, and fixes Hostinger's misleading `homedir()` value so generated voice assets survive redeploys:
-
-1. **One-time voice build:** load only `encoder.onnx` + a private local `voices/ari.wav`, write a small persistent `ari.voice` profile, release the encoder.
-2. **Normal TTS:** load the TTS model + the prepared `ari.voice`. The encoder is never loaded during normal speech generation.
-3. **Cold-process recovery:** if Hostinger gives `/v1/tts` a fresh Node PID in `idle`, that same TTS request loads the model and prepared `ari.voice` before generating the WAV. No separate warmup is required.
-
-The profile and encoder cache are stored by default under:
-
-```text
-~/.cache/aharon-tts/
-├── ari.voice
-└── encoder.onnx
-```
-
-On Hostinger, the code now detects `/home/<user>/domains/...` and stores these files under the real account home `/home/<user>/.cache/aharon-tts/`, outside both the domain tree and versioned `hbuilds/...` directories. This makes the profile survive app restarts and redeploys.
+- **TTS:** `pocket-tts-onnx`, Hebrew, custom prepared `ari.voice`.
+- **STT:** local multilingual Whisper Tiny through Transformers.js, default `q8`.
+- **No external TTS/STT API required.**
+- Persistent models and voice assets live under `/home/<user>/.cache/aharon-tts/` so Hostinger redeploys do not delete them.
+- TTS and STT inference share one queue to avoid running two CPU-heavy inference jobs simultaneously.
 
 ## Deploy
 
-Upload the complete project and redeploy with Node.js 20+.
+Deploy `main` on Hostinger with Node.js 20+ and set a fresh `TTS_API_KEY`.
 
-Set a fresh `TTS_API_KEY`. Do not reuse an API key that has already appeared in chat/logs.
+The important defaults are in `.env.example`.
 
-## Step 1 — build Ari voice once
+## TTS
 
-Run from the Hostinger SSH terminal:
+Generate a WAV:
 
 ```bash
-curl -N -X POST "https://tts.aharon.cloud/admin/build-voice/" \
+curl -X POST "https://tts.aharon.cloud/v1/tts" \
+  -H "Authorization: Bearer YOUR_NEW_KEY" \
+  -H "Content-Type: application/json" \
+  --data-raw '{"text":"שלום, זה מבחן של מערכת הקול."}' \
+  --output speech.wav
+```
+
+`/v1/tts` cold-starts the TTS model automatically when Hostinger gives the request a fresh Node process.
+
+TTS status:
+
+```bash
+curl "https://tts.aharon.cloud/ready"
+```
+
+Optional manual TTS warmup:
+
+```bash
+curl -N -X POST "https://tts.aharon.cloud/admin/warmup/" \
+  -H "Authorization: Bearer YOUR_NEW_KEY"
+```
+
+### Custom voice profile
+
+The prepared profile is stored by default at:
+
+```text
+/home/<user>/.cache/aharon-tts/ari.voice
+```
+
+Build or replace it:
+
+```bash
+curl -N -X POST "https://tts.aharon.cloud/admin/build-voice/?force=1" \
+  -H "Authorization: Bearer YOUR_NEW_KEY"
+```
+
+Normal TTS does not need the source recording after `ari.voice` has been generated.
+
+**Temporary bootstrap note:** a private encoded bootstrap recording may be committed to `voices/` only while replacing the prepared voice profile. After a successful `profile-saved`, remove that bootstrap from `main`; the persistent `ari.voice` remains outside the deployment tree.
+
+## Local STT — Whisper
+
+v0.3.0 adds local speech-to-text with `@huggingface/transformers` and `Xenova/whisper-tiny` in `q8` mode. The first load downloads the Whisper files; later loads reuse the persistent disk cache.
+
+Default STT cache:
+
+```text
+/home/<user>/.cache/aharon-tts/whisper/
+```
+
+The STT model is lazy-loaded and is unloaded from RAM after the configured idle timeout (60 seconds by default). The disk cache stays in place.
+
+### Warm up / download Whisper
+
+```bash
+curl -N -X POST "https://tts.aharon.cloud/admin/stt/warmup/" \
   -H "Authorization: Bearer YOUR_NEW_KEY"
 ```
 
@@ -41,84 +83,90 @@ Expected stages include:
 
 ```text
 accepted
-manifest
-encoder-download 0% ... 100%
-voice-decode
-voice-decoded
-encoder-session-create
-encoder-run
-profile-saved
+load-start
+loading-model
+model-progress ...
 ready
 complete
 ```
 
-If Hostinger restarts the process during the encoder **download**, run the same command again. The server keeps `encoder.onnx.part` and resumes it with HTTP Range instead of starting from zero.
-
-If the full encoder was already downloaded, later attempts show:
-
-```text
-encoder-cache-hit 100%
-```
-
-Check whether the persistent profile exists:
+STT status:
 
 ```bash
-curl "https://tts.aharon.cloud/admin/voice-status" \
+curl "https://tts.aharon.cloud/admin/stt/status" \
   -H "Authorization: Bearer YOUR_NEW_KEY"
 ```
 
-Look for:
-
-```json
-"profile":{"exists":true}
-```
-
-## Step 2 — optional manual warmup
-
-After the voice profile exists, manual warmup is optional. You can still run:
+Unload STT from RAM manually:
 
 ```bash
-curl -N -X POST "https://tts.aharon.cloud/admin/warmup/" \
+curl -X POST "https://tts.aharon.cloud/admin/stt/unload" \
   -H "Authorization: Bearer YOUR_NEW_KEY"
 ```
 
-The warmup no longer downloads or loads the voice encoder. A successful end is:
-
-```text
-[TTS] loading prepared voice 'ari' from .../.cache/aharon-tts/ari.voice
-[TTS] prepared voice 'ari' loaded ...
-[TTS] ready sampleRate=24000 defaultVoice=ari customVoiceLoaded=true
-```
-
-## Step 3 — verify (optional)
+### Transcribe WAV
 
 ```bash
-curl "https://tts.aharon.cloud/ready"
+curl -X POST "https://tts.aharon.cloud/v1/stt" \
+  -H "Authorization: Bearer YOUR_NEW_KEY" \
+  -H "Content-Type: audio/wav" \
+  --data-binary @speech.wav
 ```
 
-Expected:
+Example response:
 
 ```json
 {
   "ok": true,
-  "ready": true,
+  "text": "שלום, זה מבחן תמלול.",
   "language": "hebrew",
-  "sampleRate": 24000,
-  "defaultVoice": "ari",
-  "customVoiceLoaded": true
+  "model": "Xenova/whisper-tiny",
+  "durationSec": 4.2,
+  "sampleRate": 16000,
+  "processingMs": 1200
 }
 ```
 
-## Generate WAV
+### Telephony audio
 
-This endpoint now auto-loads the model if Hostinger recycled the Node process. A cold request will therefore be slower, but it should still return a real WAV instead of `warming_up`.
+`/v1/stt` also accepts raw telephony audio as `application/octet-stream`:
+
+- signed PCM16: `encoding=s16le`
+- G.711 μ-law / PCMU: `encoding=mulaw` or `encoding=pcmu`
+- G.711 A-law / PCMA: `encoding=alaw` or `encoding=pcma`
+
+Example for 8 kHz PCMU:
 
 ```bash
-curl -X POST "https://tts.aharon.cloud/v1/tts" \
+curl -X POST "https://tts.aharon.cloud/v1/stt?encoding=mulaw&sample_rate=8000" \
   -H "Authorization: Bearer YOUR_NEW_KEY" \
-  -H "Content-Type: application/json" \
-  --data-raw '{"text":"שלום, זה הקול המשובט שלי."}' \
-  --output speech.wav
+  -H "Content-Type: application/octet-stream" \
+  --data-binary @audio.pcmu
 ```
 
-The personal source recording is intentionally **not committed to GitHub**. After `/admin/build-voice/` succeeds on v0.2.4, the prepared profile is stored at the persistent account-level `~/.cache/aharon-tts/ari.voice`, so normal TTS does not need the WAV. To rebuild the profile later, place a private recording at `voices/ari.wav` (or set `TTS_VOICE_FILE`) and call `/admin/build-voice/`. A clean 15–20 second sample should improve similarity.
+Input is converted internally to Whisper's 16 kHz mono waveform.
+
+## STT environment variables
+
+```env
+STT_MODEL=Xenova/whisper-tiny
+STT_DTYPE=q8
+STT_LANGUAGE=hebrew
+STT_IDLE_UNLOAD_MS=60000
+STT_MAX_AUDIO_BYTES=8388608
+STT_MAX_AUDIO_SECONDS=120
+```
+
+Optional:
+
+```env
+STT_CACHE_DIR=/home/USER/.cache/aharon-tts/whisper
+```
+
+## Health
+
+```bash
+curl "https://tts.aharon.cloud/health"
+```
+
+`/health` reports both TTS and STT state, model information, process ID and voice-build status.
