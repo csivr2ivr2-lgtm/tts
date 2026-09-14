@@ -113,12 +113,12 @@ function createNodeSipSocket(WebSocketCtor, url, { onDiagnostic, origin, handsha
 }
 
 export function createSipController(options = {}) {
-  const wsUrl = String(options.wsUrl || process.env.SIP_WS_URL || "wss://sip.yemot.co.il:8089/ws").trim();
+  const wsUrl = String(options.wsUrl || process.env.SIP_WS_URL || "wss://sip.yemot.co.il/ws").trim();
   const domain = String(options.domain || process.env.SIP_DOMAIN || "sip.yemot.co.il").trim();
   const user = String(options.user || process.env.SIP_USER || "").trim();
   const password = String(options.password || process.env.SIP_PASSWORD || "");
   const ha1 = String(options.ha1 || process.env.SIP_HA1 || "").trim();
-  const realm = String(options.realm || process.env.SIP_REALM || domain).trim();
+  const realm = String(options.realm || process.env.SIP_REALM || `${domain}.wss`).trim();
   const hasCredential = Boolean(password || ha1);
   const uri = String(options.uri || process.env.SIP_URI || (user ? `sip:${user}@${domain}` : "")).trim();
   const displayName = String(options.displayName || process.env.SIP_DISPLAY_NAME || "Aharon Voice AI").trim();
@@ -156,8 +156,6 @@ export function createSipController(options = {}) {
 
   const info = () => ({
     configured: Boolean(user && hasCredential && uri),
-    authMode: ha1 ? "ha1" : (password ? "password" : "none"),
-    realm: realm || null,
     status,
     connected,
     registered,
@@ -169,6 +167,8 @@ export function createSipController(options = {}) {
     ipFamily: ipFamily || "auto",
     uri: uri || null,
     domain,
+    realm,
+    authMode: ha1 ? "ha1" : (password ? "password" : "none"),
     autoConnect: Boolean(autoConnect),
     rejectUnbridged: Boolean(rejectUnbridged),
     registerExpires,
@@ -249,6 +249,11 @@ export function createSipController(options = {}) {
       error.code = "SIP_NOT_CONFIGURED";
       throw error;
     }
+    if (ha1 && !/^[a-f0-9]{32}$/i.test(ha1)) {
+      const error = new Error("SIP_HA1 must be a 32-character hexadecimal MD5 digest");
+      error.code = "SIP_INVALID_HA1";
+      throw error;
+    }
     if (registered || status === "connecting" || connectPromise) return info();
 
     connectPromise = (async () => {
@@ -260,11 +265,6 @@ export function createSipController(options = {}) {
           ipFamily,
           onDiagnostic: (event) => { lastTransport = event; }
         });
-        if (ha1 && !/^[a-f0-9]{32}$/i.test(ha1)) {
-          const error = new Error("SIP_HA1 must be a 32-character hexadecimal MD5 HA1 value");
-          error.code = "SIP_INVALID_HA1";
-          throw error;
-        }
         const uaConfig = {
           sockets: [socket],
           uri,
@@ -277,7 +277,7 @@ export function createSipController(options = {}) {
         };
         if (ha1) {
           uaConfig.ha1 = ha1;
-          uaConfig.realm = realm || domain;
+          uaConfig.realm = realm;
         } else {
           uaConfig.password = password;
         }
