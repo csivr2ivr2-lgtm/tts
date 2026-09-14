@@ -7,8 +7,8 @@
     "node": ">=20"
   },
   "scripts": {
-    "start": "node src/server.js",
-    "check": "node --check src/server.js && node --check src/audio.js && node --check src/voice-profile.js && node --check src/stt.js"
+    "start": "node src/start.js",
+    "check": "node --check src/start.js && node --check src/server.js && node --check src/audio.js && node --check src/voice-profile.js && node --check src/stt.js"
   },
   "dependencies": {
     "express": "^5.1.0",
