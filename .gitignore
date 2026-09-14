@@ -1,0 +1,11 @@
+node_modules/
+.env
+*.log
+speech.wav
+.cache/
+
+# Personal voice recordings are private and must not be committed.
+voices/*.wav
+voices/*.mp3
+voices/*.m4a
+*.voice
