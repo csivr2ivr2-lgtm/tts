@@ -1,11 +1,10 @@
 import express from "express";
 import crypto from "node:crypto";
 import { defaultProfilePath, buildVoiceProfile, inspectVoiceProfile, loadVoiceProfile } from "./voice-profile.js";
-import { createSttEngine, decodeSttAudio } from "./stt.js";
 
 for (const k of ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "ORT_NUM_THREADS"]) process.env[k] ||= "1";
 
-const VERSION = "0.3.0";
+const VERSION = "0.3.1";
 const PORT = Number(process.env.PORT || 3000);
 const API_KEY = process.env.TTS_API_KEY || "";
 const LANGUAGE = process.env.TTS_LANGUAGE || "hebrew";
@@ -38,7 +37,46 @@ let voiceBuildError = null;
 let voiceBuildInfo = {};
 const customVoices = new Map();
 const wavCache = new Map();
-const stt = createSttEngine();
+let stt = null;
+let sttModule = null;
+let sttImportPromise = null;
+let sttImportError = null;
+
+function sttInfo() {
+  if (stt) return stt.info();
+  return {
+    status: sttImportError ? "error" : "idle",
+    stage: sttImportError ? "module-import-error" : "idle",
+    error: sttImportError || null,
+    model: process.env.STT_MODEL || "Xenova/whisper-tiny",
+    dtype: process.env.STT_DTYPE || "q8",
+    language: process.env.STT_LANGUAGE || "hebrew",
+    sampleRate: 16000,
+    loaded: false,
+    idleUnloadMs: Number(process.env.STT_IDLE_UNLOAD_MS || 60000)
+  };
+}
+
+async function ensureStt() {
+  if (stt && sttModule) return { stt, mod: sttModule };
+  if (sttImportPromise) return sttImportPromise;
+  sttImportPromise = import("./stt.js")
+    .then((mod) => {
+      sttModule = mod;
+      stt = mod.createSttEngine();
+      sttImportError = null;
+      return { stt, mod };
+    })
+    .catch((error) => {
+      stt = null;
+      sttModule = null;
+      sttImportError = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+      console.error("[STT] module import failed; TTS remains available:", error);
+      throw error;
+    })
+    .finally(() => { sttImportPromise = null; });
+  return sttImportPromise;
+}
 
 function auth(req, res, next) {
   if (!API_KEY) return next();
@@ -137,7 +175,7 @@ function ndjson(res) {
 
 app.get("/health", (_req, res) => res.json({
   ok: true, service: "aharon-voice-ai", version: VERSION, pid: process.pid, uptimeSec: Math.floor(process.uptime()),
-  tts: { status: ttsStatus, stage: ttsStage, error: ttsError, ...ttsInfo }, stt: stt.info(),
+  tts: { status: ttsStatus, stage: ttsStage, error: ttsError, ...ttsInfo }, stt: sttInfo(),
   voiceBuild: { status: voiceBuildStatus, stage: voiceBuildStage, error: voiceBuildError }
 }));
 
@@ -186,32 +224,45 @@ async function buildVoice(req, res) {
 }
 app.post(["/admin/build-voice", "/admin/build-voice/"], auth, buildVoice);
 
-app.get("/admin/stt/status", auth, (_req, res) => res.json({ ok: true, ...stt.info() }));
+app.get("/admin/stt/status", auth, (_req, res) => res.json({ ok: !sttImportError, ...sttInfo() }));
 async function warmStt(_req, res) {
-  const write = ndjson(res); write({ stage: "accepted", pid: process.pid, ...stt.info() });
-  try { await stt.load(write); write({ stage: "complete", ready: true, ...stt.info() }); }
-  catch (e) { write({ stage: "error", error: e instanceof Error ? `${e.name}: ${e.message}` : String(e) }); }
-  finally { if (!res.writableEnded) res.end(); }
+  const write = ndjson(res);
+  write({ stage: "accepted", pid: process.pid, ...sttInfo() });
+  try {
+    const { stt: engine } = await ensureStt();
+    await engine.load(write);
+    write({ stage: "complete", ready: true, ...engine.info() });
+  } catch (e) {
+    write({ stage: "error", error: e instanceof Error ? `${e.name}: ${e.message}` : String(e), stt: sttInfo() });
+  } finally { if (!res.writableEnded) res.end(); }
 }
 app.post(["/admin/stt/warmup", "/admin/stt/warmup/"], auth, warmStt);
 app.post("/admin/stt/unload", auth, async (_req, res) => {
-  try { const unloaded = await stt.unload(); res.json({ ok: true, unloaded, ...stt.info() }); }
-  catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+  try {
+    if (!stt) return res.json({ ok: true, unloaded: false, ...sttInfo() });
+    const unloaded = await stt.unload();
+    res.json({ ok: true, unloaded, ...sttInfo() });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e), stt: sttInfo() }); }
 });
 
 const rawAudio = express.raw({ type: ["audio/wav", "audio/x-wav", "audio/wave", "application/octet-stream"], limit: STT_MAX_AUDIO_BYTES });
 app.post("/v1/stt", auth, rawAudio, async (req, res) => {
   if (!Buffer.isBuffer(req.body)) return res.status(415).json({ ok: false, error: "unsupported_media_type" });
-  let audio;
+  let engine, mod, audio;
   try {
+    ({ stt: engine, mod } = await ensureStt());
     const type = (req.get("content-type") || "").split(";")[0].toLowerCase();
-    audio = decodeSttAudio(req.body, { encoding: type.includes("wav") ? "wav" : String(req.query.encoding || "s16le"), sampleRate: Number(req.query.sample_rate || 8000) });
-  } catch (e) { return res.status(400).json({ ok: false, error: "invalid_audio", message: e.message }); }
+    audio = mod.decodeSttAudio(req.body, { encoding: type.includes("wav") ? "wav" : String(req.query.encoding || "s16le"), sampleRate: Number(req.query.sample_rate || 8000) });
+  } catch (e) {
+    const message = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+    const importFailure = Boolean(sttImportError);
+    return res.status(importFailure ? 503 : 400).json({ ok: false, error: importFailure ? "stt_unavailable" : "invalid_audio", message, stt: sttInfo() });
+  }
   if (audio.durationSec > STT_MAX_AUDIO_SECONDS) return res.status(413).json({ ok: false, error: "audio_too_long", maxSeconds: STT_MAX_AUDIO_SECONDS });
   try {
-    const result = await enqueue(() => stt.transcribe(audio.samples, { language: String(req.query.language || process.env.STT_LANGUAGE || "hebrew"), timestamps: req.query.timestamps !== "0" && req.query.timestamps !== "false" }));
-    res.json({ ok: true, text: result.text, chunks: result.chunks, language: String(req.query.language || process.env.STT_LANGUAGE || "hebrew"), model: stt.info().model, durationSec: Number(audio.durationSec.toFixed(3)), sourceSampleRate: audio.sourceSampleRate, sampleRate: audio.sampleRate, processingMs: result.processingMs });
-  } catch (e) { res.status(500).json({ ok: false, error: "stt_failed", message: e instanceof Error ? `${e.name}: ${e.message}` : String(e), stt: stt.info() }); }
+    const result = await enqueue(() => engine.transcribe(audio.samples, { language: String(req.query.language || process.env.STT_LANGUAGE || "hebrew"), timestamps: req.query.timestamps !== "0" && req.query.timestamps !== "false" }));
+    res.json({ ok: true, text: result.text, chunks: result.chunks, language: String(req.query.language || process.env.STT_LANGUAGE || "hebrew"), model: engine.info().model, durationSec: Number(audio.durationSec.toFixed(3)), sourceSampleRate: audio.sourceSampleRate, sampleRate: audio.sampleRate, processingMs: result.processingMs });
+  } catch (e) { res.status(500).json({ ok: false, error: "stt_failed", message: e instanceof Error ? `${e.name}: ${e.message}` : String(e), stt: sttInfo() }); }
 });
 
 app.post("/v1/tts", auth, async (req, res) => {
@@ -251,6 +302,7 @@ app.use((err, _req, res, _next) => {
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Aharon Voice AI v${VERSION} listening on 0.0.0.0:${PORT}`);
-  console.log(`TTS=${LANGUAGE}/${VOICE_NAME}; STT=${stt.info().model}/${stt.info().dtype}/${stt.info().language}`);
+  const si = sttInfo();
+  console.log(`TTS=${LANGUAGE}/${VOICE_NAME}; STT=${si.model}/${si.dtype}/${si.language} (lazy)`);
   console.log(`Voice profile: ${VOICE_PROFILE_FILE}`);
 });
