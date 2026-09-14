@@ -170,3 +170,61 @@ curl "https://tts.aharon.cloud/health"
 ```
 
 `/health` reports both TTS and STT state, model information, process ID and voice-build status.
+
+
+## SIP control plane — Yemot WSS
+
+v0.5.0 adds a server-side SIP registration controller for Yemot using secure SIP over WebSocket.
+
+Yemot WSS endpoint:
+
+```text
+wss://sip.yemot.co.il:8089/ws
+```
+
+Keep SIP credentials only in Hostinger environment variables:
+
+```env
+SIP_WS_URL=wss://sip.yemot.co.il:8089/ws
+SIP_DOMAIN=sip.yemot.co.il
+SIP_USER=YOUR_SIP_ACCOUNT_ID
+SIP_PASSWORD=YOUR_SIP_PASSWORD
+SIP_DISPLAY_NAME=Aharon Voice AI
+SIP_REGISTER_EXPIRES=300
+SIP_AUTO_CONNECT=false
+SIP_REJECT_UNBRIDGED=true
+```
+
+After deployment, start registration:
+
+```bash
+curl -X POST "https://tts.aharon.cloud/admin/sip/connect" \
+  -H "Authorization: Bearer YOUR_KEY"
+```
+
+Check registration state:
+
+```bash
+curl "https://tts.aharon.cloud/admin/sip/status" \
+  -H "Authorization: Bearer YOUR_KEY"
+```
+
+A successful registration reports:
+
+```json
+{
+  "configured": true,
+  "status": "registered",
+  "connected": true,
+  "registered": true
+}
+```
+
+Disconnect manually:
+
+```bash
+curl -X POST "https://tts.aharon.cloud/admin/sip/disconnect" \
+  -H "Authorization: Bearer YOUR_KEY"
+```
+
+The SIP password is never included in status responses. Until the WebRTC media bridge is enabled, incoming SIP INVITEs are rejected cleanly instead of being answered without media.
