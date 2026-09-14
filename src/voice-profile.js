@@ -1,7 +1,8 @@
 import { createWriteStream } from "node:fs";
-import { access, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
+import { gunzipSync } from "node:zlib";
 import { Readable, Transform } from "node:stream";
 import { pipeline as streamPipeline } from "node:stream/promises";
 import { loadMonoWav } from "./audio.js";
@@ -18,10 +19,6 @@ function persistentStorageDir() {
   const override = String(process.env.TTS_PERSIST_DIR || "").trim();
   if (override) return path.resolve(override);
 
-  // Hostinger managed Node apps may report HOME/homedir() inside the domain
-  // deployment tree (for example /home/u123/domains/example.com). That tree
-  // is replaced on every deploy. Infer the real account home from cwd/HOME
-  // and keep generated voice assets one level above /domains instead.
   const candidates = [process.cwd(), process.env.HOME, homedir()].filter(Boolean);
   for (const candidate of candidates) {
     const normalized = path.resolve(String(candidate));
@@ -195,7 +192,42 @@ export async function buildVoiceProfile({
   );
 
   onProgress?.({ stage: "voice-decode", sampleRate });
-  const decoded = await loadMonoWav(path.resolve(process.cwd(), voiceFile), sampleRate);
+  let resolvedVoiceFile = path.resolve(process.cwd(), voiceFile);
+  let removeBootstrapVoice = false;
+
+  if (!(await exists(resolvedVoiceFile))) {
+    const bootstrapB64 = `${resolvedVoiceFile}.gz.b64`;
+    let encoded = "";
+
+    if (await exists(bootstrapB64)) {
+      encoded = (await readFile(bootstrapB64, "utf8")).trim();
+    } else {
+      const dir = path.dirname(resolvedVoiceFile);
+      const prefix = `${path.basename(resolvedVoiceFile)}.gz.b64.part`;
+      let parts = [];
+      try {
+        parts = (await readdir(dir)).filter((name) => name.startsWith(prefix)).sort();
+      } catch {
+        parts = [];
+      }
+      if (parts.length) {
+        encoded = (await Promise.all(parts.map((name) => readFile(path.join(dir, name), "utf8"))))
+          .join("")
+          .trim();
+      }
+    }
+
+    if (encoded) {
+      const bytes = gunzipSync(Buffer.from(encoded, "base64"));
+      resolvedVoiceFile = path.join(path.dirname(profilePath), `${voiceName}.bootstrap.wav`);
+      await mkdir(path.dirname(resolvedVoiceFile), { recursive: true });
+      await writeFile(resolvedVoiceFile, bytes);
+      removeBootstrapVoice = true;
+      onProgress?.({ stage: "voice-bootstrap-decoded", bytes: bytes.length, voiceFile: resolvedVoiceFile });
+    }
+  }
+
+  const decoded = await loadMonoWav(resolvedVoiceFile, sampleRate);
   if (decoded.durationSec < 2) throw new Error("Custom voice sample must be at least 2 seconds");
   const audio = padAudio(decoded.samples, frameSize);
   onProgress?.({
@@ -243,6 +275,13 @@ export async function buildVoiceProfile({
     if (!keepEncoder) {
       try {
         await rm(encoderPath, { force: true });
+      } catch {
+      }
+    }
+    if (removeBootstrapVoice) {
+      try {
+        await rm(resolvedVoiceFile, { force: true });
+        onProgress?.({ stage: "voice-bootstrap-deleted", voiceFile: resolvedVoiceFile });
       } catch {
       }
     }
