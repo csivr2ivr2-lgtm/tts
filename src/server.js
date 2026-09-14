@@ -250,7 +250,7 @@ app.post("/admin/stt/unload", auth, async (_req, res) => {
   } catch (e) { res.status(500).json({ ok: false, error: String(e), stt: sttInfo() }); }
 });
 
-app.get("/admin/sip/status", auth, (_req, res) => res.json({ ok: true, ...sip.info() }));
+app.get("/admin/sip/status", auth, (_req, res) => res.json({ ok: true, pid: process.pid, uptimeSec: Math.floor(process.uptime()), ...sip.info() }));
 app.post("/admin/sip/probe", auth, async (_req, res) => {
   try {
     const result = await sip.probe();
