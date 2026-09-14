@@ -125,6 +125,7 @@ export function createSipController(options = {}) {
   const wsOrigin = String(options.wsOrigin || process.env.SIP_WS_ORIGIN || "").trim();
   const wsHandshakeTimeoutMs = Number(options.wsHandshakeTimeoutMs || process.env.SIP_WS_HANDSHAKE_TIMEOUT_MS || 10000);
   const connectTimeoutMs = Number(options.connectTimeoutMs || process.env.SIP_CONNECT_TIMEOUT_MS || 15000);
+  const connectionRecovery = options.connectionRecovery ?? booleanEnv("SIP_CONNECTION_RECOVERY", false);
   const requestedIpFamily = Number(options.ipFamily ?? process.env.SIP_IP_FAMILY ?? 0);
   const ipFamily = requestedIpFamily === 4 || requestedIpFamily === 6 ? requestedIpFamily : 0;
 
@@ -159,6 +160,7 @@ export function createSipController(options = {}) {
     wsOrigin: wsOrigin || null,
     wsHandshakeTimeoutMs,
     connectTimeoutMs,
+    connectionRecovery: Boolean(connectionRecovery),
     ipFamily: ipFamily || "auto",
     uri: uri || null,
     domain,
@@ -193,6 +195,11 @@ export function createSipController(options = {}) {
       connected = false;
       registered = false;
       touch("disconnected", "disconnected", reasonFromEvent(event));
+      if (!connectionRecovery) {
+        setImmediate(() => {
+          try { nextUa.stop(); } catch {}
+        });
+      }
     });
     nextUa.on("registered", () => {
       connected = true;
@@ -256,8 +263,8 @@ export function createSipController(options = {}) {
           display_name: displayName,
           register: true,
           register_expires: Number.isFinite(registerExpires) ? registerExpires : 300,
-          connection_recovery_min_interval: 2,
-          connection_recovery_max_interval: 30
+          connection_recovery_min_interval: connectionRecovery ? 2 : 600,
+          connection_recovery_max_interval: connectionRecovery ? 30 : 600
         });
         wireUa(ua);
         touch("start", "connecting");
@@ -348,162 +355,154 @@ export function createSipController(options = {}) {
     });
   }
 
-  async function diagnoseTransport() {
+  async function diagnostics() {
     const parsed = new URL(wsUrl);
     const host = parsed.hostname;
-    const port = Number(parsed.port || (parsed.protocol === "wss:" ? 443 : 80));
-    const timeoutMs = Math.max(1500, Math.min(Number(process.env.SIP_DIAGNOSTIC_TIMEOUT_MS || 5000), 15000));
+    const port = Number(parsed.port || 443);
     const startedAt = Date.now();
-
-    let addresses = [];
-    let dnsError = null;
-    try {
-      addresses = await dns.lookup(host, { all: true, verbatim: true });
-    } catch (error) {
-      dnsError = safeError(error);
-    }
-
-    const unique = [];
-    const seen = new Set();
-    for (const item of addresses) {
-      const key = `${item.family}:${item.address}`;
-      if (!seen.has(key)) { seen.add(key); unique.push(item); }
-    }
-
-    const tcpProbe = (address, family) => new Promise((resolve) => {
-      const started = Date.now();
-      let settled = false;
-      const socket = net.createConnection({ host: address, port, family });
-      const finish = (result) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        try { socket.destroy(); } catch {}
-        resolve({ elapsedMs: Date.now() - started, ...result });
-      };
-      const timer = setTimeout(() => finish({ ok: false, stage: "timeout", error: `TCP timeout after ${timeoutMs}ms` }), timeoutMs);
-      timer.unref?.();
-      socket.once("connect", () => finish({ ok: true, stage: "connected", localAddress: socket.localAddress || null, localPort: socket.localPort || null }));
-      socket.once("error", (error) => finish({ ok: false, stage: "error", error: safeError(error), code: error?.code || null }));
-    });
-
-    const tlsProbe = (address, family) => new Promise((resolve) => {
-      const started = Date.now();
-      let settled = false;
-      const socket = tls.connect({
-        host: address,
-        port,
-        family,
-        servername: host,
-        rejectUnauthorized: true,
-        ALPNProtocols: ["http/1.1"]
-      });
-      const finish = (result) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        try { socket.destroy(); } catch {}
-        resolve({ elapsedMs: Date.now() - started, ...result });
-      };
-      const timer = setTimeout(() => finish({ ok: false, stage: "timeout", error: `TLS timeout after ${timeoutMs}ms` }), timeoutMs);
-      timer.unref?.();
-      socket.once("secureConnect", () => {
-        const cert = socket.getPeerCertificate?.() || {};
-        const cipher = socket.getCipher?.() || {};
-        finish({
-          ok: true,
-          stage: "secure",
-          authorized: Boolean(socket.authorized),
-          authorizationError: socket.authorizationError || null,
-          protocol: socket.getProtocol?.() || null,
-          alpnProtocol: socket.alpnProtocol || null,
-          cipher: cipher.name || null,
-          certificate: {
-            subjectCN: cert?.subject?.CN || null,
-            issuerCN: cert?.issuer?.CN || null,
-            validTo: cert?.valid_to || null
-          }
-        });
-      });
-      socket.once("error", (error) => finish({ ok: false, stage: "error", error: safeError(error), code: error?.code || null }));
-    });
-
-    const { WebSocketCtor } = await loadDeps();
-    const wsProbe = (address, family, origin) => new Promise((resolve) => {
-      const started = Date.now();
-      let settled = false;
-      const opts = {
-        perMessageDeflate: false,
-        handshakeTimeout: timeoutMs,
-        lookup: (_hostname, _options, callback) => callback(null, address, family)
-      };
-      if (origin) opts.origin = origin;
-      const ws = new WebSocketCtor(wsUrl, "sip", opts);
-      const finish = (result) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        try { ws.terminate(); } catch {}
-        resolve({ elapsedMs: Date.now() - started, origin: origin || null, ...result });
-      };
-      const timer = setTimeout(() => finish({ ok: false, stage: "timeout", error: `WebSocket timeout after ${timeoutMs}ms` }), timeoutMs + 250);
-      timer.unref?.();
-      ws.once("open", () => finish({ ok: true, stage: "open", protocol: ws.protocol || null }));
-      ws.once("unexpected-response", (_req, response) => finish({
-        ok: false,
-        stage: "unexpected-response",
-        statusCode: response?.statusCode || null,
-        statusMessage: response?.statusMessage || null
-      }));
-      ws.once("error", (error) => finish({ ok: false, stage: "error", error: safeError(error), code: error?.code || null }));
-      ws.once("close", (code, reason) => {
-        if (settled) return;
-        const text = Buffer.isBuffer(reason) ? reason.toString("utf8") : String(reason || "");
-        finish({ ok: false, stage: "close", code, reason: text || null });
-      });
-    });
-
-    const attempts = [];
-    const targets = unique.length ? unique : [];
-    const originCandidates = wsOrigin
-      ? [wsOrigin]
-      : [null, "https://tts.aharon.cloud"];
-
-    for (const target of targets) {
-      const entry = { address: target.address, family: target.family };
-      entry.tcp = await tcpProbe(target.address, target.family);
-      if (entry.tcp.ok) entry.tls = await tlsProbe(target.address, target.family);
-      else entry.tls = { ok: false, stage: "skipped", error: "TCP failed" };
-      entry.websocket = [];
-      if (entry.tls.ok) {
-        for (const origin of originCandidates) {
-          const result = await wsProbe(target.address, target.family, origin);
-          entry.websocket.push(result);
-          if (result.ok) break;
-        }
-      }
-      attempts.push(entry);
-    }
-
-    const anyTcp = attempts.some((a) => a.tcp?.ok);
-    const anyTls = attempts.some((a) => a.tls?.ok);
-    const anyWs = attempts.some((a) => a.websocket?.some((w) => w.ok));
-    let conclusion = "dns_failed";
-    if (unique.length) conclusion = anyTcp ? (anyTls ? (anyWs ? "websocket_open" : "websocket_handshake_failed") : "tls_failed") : "tcp_failed";
-
+    const timeoutMs = Math.min(Math.max(wsHandshakeTimeoutMs, 3000), 10000);
     const result = {
-      ok: anyWs,
+      ok: false,
       wsUrl,
       host,
       port,
-      elapsedMs: Date.now() - startedAt,
-      dns: { ok: unique.length > 0, error: dnsError, addresses: unique },
-      attempts,
-      conclusion
+      elapsedMs: 0,
+      dns: { ok: false, error: null, addresses: [] },
+      attempts: [],
+      conclusion: "unknown"
     };
-    lastTransport = { event: "diagnostics", conclusion, at: Date.now() };
+
+    try {
+      const addresses = await dns.lookup(host, { all: true, verbatim: true });
+      result.dns = { ok: addresses.length > 0, error: null, addresses };
+    } catch (error) {
+      result.dns.error = safeError(error);
+      result.conclusion = "dns_failed";
+      result.elapsedMs = Date.now() - startedAt;
+      lastTransport = { event: "diagnostics", conclusion: result.conclusion, at: Date.now() };
+      return result;
+    }
+
+    const { WebSocketCtor } = await loadDeps();
+    for (const entry of result.dns.addresses) {
+      if (ipFamily && entry.family !== ipFamily) continue;
+      const attempt = { address: entry.address, family: entry.family, tcp: null, tls: null, websocket: [] };
+      result.attempts.push(attempt);
+
+      attempt.tcp = await new Promise((resolve) => {
+        const started = Date.now();
+        let settled = false;
+        const socket = net.connect({ host: entry.address, port, family: entry.family });
+        const finish = (payload) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          try { socket.destroy(); } catch {}
+          resolve({ elapsedMs: Date.now() - started, ...payload });
+        };
+        const timer = setTimeout(() => finish({ ok: false, stage: "timeout", error: `TCP timeout after ${timeoutMs}ms` }), timeoutMs);
+        socket.once("connect", () => finish({ ok: true, stage: "connected", localAddress: socket.localAddress || null, localPort: socket.localPort || null }));
+        socket.once("error", (error) => finish({ ok: false, stage: "error", error: safeError(error) }));
+      });
+
+      if (!attempt.tcp.ok) {
+        attempt.tls = { ok: false, stage: "skipped", error: "TCP failed" };
+        continue;
+      }
+
+      attempt.tls = await new Promise((resolve) => {
+        const started = Date.now();
+        let settled = false;
+        const socket = tls.connect({
+          host: entry.address,
+          port,
+          family: entry.family,
+          servername: host,
+          rejectUnauthorized: true
+        });
+        const finish = (payload) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          try { socket.destroy(); } catch {}
+          resolve({ elapsedMs: Date.now() - started, ...payload });
+        };
+        const timer = setTimeout(() => finish({ ok: false, stage: "timeout", error: `TLS timeout after ${timeoutMs}ms` }), timeoutMs);
+        socket.once("secureConnect", () => {
+          const cert = socket.getPeerCertificate?.() || {};
+          finish({
+            ok: true,
+            stage: "secure",
+            authorized: socket.authorized,
+            authorizationError: socket.authorizationError || null,
+            protocol: socket.getProtocol?.() || null,
+            cipher: socket.getCipher?.()?.name || null,
+            peerSubject: cert.subject || null,
+            peerIssuer: cert.issuer || null,
+            peerValidTo: cert.valid_to || null
+          });
+        });
+        socket.once("error", (error) => finish({ ok: false, stage: "error", error: safeError(error) }));
+      });
+
+      if (!attempt.tls.ok) continue;
+
+      const origins = [...new Set([wsOrigin || null, "https://tts.aharon.cloud"].filter((v, index, all) => index === all.indexOf(v)))];
+      for (const origin of origins) {
+        const wsResult = await new Promise((resolve) => {
+          const started = Date.now();
+          let settled = false;
+          const finish = (payload, ws) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            try { ws?.terminate?.(); } catch {}
+            resolve({ elapsedMs: Date.now() - started, origin, ...payload });
+          };
+          const opts = {
+            perMessageDeflate: false,
+            handshakeTimeout: timeoutMs,
+            family: entry.family,
+            lookup: (_hostname, _opts, callback) => callback(null, entry.address, entry.family),
+            servername: host
+          };
+          if (origin) opts.origin = origin;
+          const ws = new WebSocketCtor(wsUrl, "sip", opts);
+          const timer = setTimeout(() => finish({ ok: false, stage: "timeout", error: `WebSocket timeout after ${timeoutMs}ms` }, ws), timeoutMs);
+          ws.once("open", () => finish({ ok: true, stage: "open", protocol: ws.protocol || "sip" }, ws));
+          ws.once("unexpected-response", (_req, response) => finish({ ok: false, stage: "unexpected-response", statusCode: response?.statusCode || null, statusMessage: response?.statusMessage || null }, ws));
+          ws.once("error", (error) => finish({ ok: false, stage: "error", error: safeError(error) }, ws));
+          ws.once("close", (code, reason) => {
+            const text = Buffer.isBuffer(reason) ? reason.toString("utf8") : String(reason || "");
+            finish({ ok: false, stage: "close", code, reason: text || null }, ws);
+          });
+        });
+        attempt.websocket.push(wsResult);
+        if (wsResult.ok) {
+          result.ok = true;
+          result.conclusion = "websocket_open";
+          result.workingAddress = entry.address;
+          result.workingFamily = entry.family;
+          result.workingOrigin = wsResult.origin;
+          break;
+        }
+      }
+      if (result.ok) break;
+    }
+
+    if (!result.ok) {
+      const anyTcp = result.attempts.some((item) => item.tcp?.ok);
+      const anyTls = result.attempts.some((item) => item.tls?.ok);
+      const anyWs = result.attempts.some((item) => item.websocket?.some((w) => w.ok));
+      if (!result.dns.ok) result.conclusion = "dns_failed";
+      else if (!anyTcp) result.conclusion = "tcp_failed";
+      else if (!anyTls) result.conclusion = "tls_failed";
+      else if (!anyWs) result.conclusion = "websocket_handshake_failed";
+    }
+    result.elapsedMs = Date.now() - startedAt;
+    lastTransport = { event: "diagnostics", conclusion: result.conclusion, at: Date.now() };
     return result;
   }
 
-  return { connect, disconnect, probe, diagnoseTransport, info };
+  return { connect, disconnect, probe, diagnostics, info };
 }
