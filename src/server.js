@@ -7,7 +7,7 @@ import { createBroadcastEngine, float32ToPcm16 } from "./broadcast.js";
 import { createBroadcastJob, getBroadcastJob, patchBroadcastJob, recoverableBroadcastJobs, pruneBroadcastJobs, broadcastJobStoreInfo } from "./broadcast-job-store.js";
 
 for (const k of ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "ORT_NUM_THREADS"]) process.env[k] ||= "1";
-const VERSION = "0.8.1";
+const VERSION = "0.8.2";
 const PORT = Number(process.env.PORT || 3000);
 const API_KEY = process.env.TTS_API_KEY || "";
 const LANGUAGE = process.env.TTS_LANGUAGE || "hebrew";
@@ -267,6 +267,10 @@ app.get("/v1/broadcast/jobs/:id",auth,(req,res)=>{
 app.post("/v1/broadcast/segment",auth,(req,res)=>{
   const text=typeof req.body?.text==="string"?req.body.text.trim():(typeof req.body?.content?.text==="string"?req.body.content.text.trim():"");
   if(!text)return res.status(400).json({ok:false,error:"text is required"});
+  const language=String(req.body?.content?.language||req.body?.language||"").toLowerCase();
+  const questionMarks=(text.match(/\\?/g)||[]).length;
+  const looksLikeBrokenHebrew=(language==="he"||language==="hebrew")&&!/[\\u0590-\\u05ff]/.test(text)&&questionMarks>=3;
+  if(text.includes("\\uFFFD")||looksLikeBrokenHebrew)return res.status(400).json({ok:false,error:"invalid_text_encoding",message:"Text appears to be corrupted before reaching the TTS service. Send JSON as UTF-8.",language,questionMarks});
   if(text.length>MAX_TEXT_LENGTH)return res.status(413).json({ok:false,error:"text is too long; max "+MAX_TEXT_LENGTH});
   const id=typeof req.body?.id==="string"&&req.body.id.trim()?req.body.id.trim():"segment_"+crypto.randomUUID();
   if(id.length>200)return res.status(400).json({ok:false,error:"id is too long"});
