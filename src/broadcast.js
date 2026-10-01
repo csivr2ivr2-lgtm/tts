@@ -138,7 +138,8 @@ export function createBroadcastEngine(options = {}) {
 
     if (currentOffset >= current.pcm.length) {
       if (!current.gapAppended) {
-        const segmentGapMs = Number.isFinite(Number(current.meta?.gapMs)) ? Math.max(0, Number(current.meta.gapMs)) : gapMs;\n        const gapBytes = Math.round((sampleRate * segmentGapMs) / 1000) * 2;
+        const segmentGapMs = Number.isFinite(Number(current.meta?.gapMs)) ? Math.max(0, Number(current.meta.gapMs)) : gapMs;
+        const gapBytes = Math.round((sampleRate * segmentGapMs) / 1000) * 2;
         current.gapAppended = true;
         if (gapBytes > 0) current.pcm = Buffer.concat([current.pcm, Buffer.alloc(gapBytes)]);
       }
