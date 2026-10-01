@@ -1,6 +1,6 @@
 {
   "name": "aharon-tts-server",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -8,7 +8,7 @@
   },
   "scripts": {
     "start": "node src/start.js",
-    "check": "node --check src/start.js && node --check src/server.js && node --check src/broadcast.js"
+    "check": "node --check src/start.js && node --check src/server.js && node --check src/broadcast.js && node --check src/broadcast-job-store.js"
   },
   "dependencies": {
     "express": "^5.1.0",

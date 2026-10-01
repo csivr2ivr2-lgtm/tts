@@ -41,6 +41,7 @@ export function createBroadcastEngine(options = {}) {
   let sampleRate = Number(options.sampleRate || 0) || null;
   const listeners = new Set();
   const rawListeners = new Set();
+  const eventListeners = new Set();
   const queue = [];
   let current = null;
   let currentOffset = 0;
@@ -78,12 +79,33 @@ export function createBroadcastEngine(options = {}) {
     writeTo(rawListeners, buffer);
   }
 
+  function publicItem(item) {
+    if (!item) return null;
+    return {
+      id: item.id,
+      sampleRate: item.sampleRate,
+      durationSec: item.durationSec,
+      priority: item.priority,
+      meta: item.meta,
+      queuedAt: item.queuedAt,
+      startedAt: item.startedAt,
+      finishedAt: item.finishedAt,
+    };
+  }
+
+  function emit(event) {
+    for (const listener of [...eventListeners]) {
+      try { listener(event); } catch {}
+    }
+  }
+
   function startNext() {
     current = queue.shift() || null;
     currentOffset = 0;
     if (current) {
       current.startedAt = Date.now();
       lastStartedAt = current.startedAt;
+      emit({ type: "started", segment: publicItem(current), at: current.startedAt });
     }
   }
 
@@ -92,6 +114,7 @@ export function createBroadcastEngine(options = {}) {
     current.finishedAt = Date.now();
     lastFinishedAt = current.finishedAt;
     playedSegments += 1;
+    emit({ type: "finished", segment: publicItem(current), at: current.finishedAt });
     current = null;
     currentOffset = 0;
   }
@@ -203,6 +226,12 @@ export function createBroadcastEngine(options = {}) {
     ensureTimer();
   }
 
+  function subscribe(listener) {
+    if (typeof listener !== "function") throw new Error("Broadcast listener must be a function");
+    eventListeners.add(listener);
+    return () => eventListeners.delete(listener);
+  }
+
   function info() {
     return {
       sampleRate,
@@ -237,5 +266,5 @@ export function createBroadcastEngine(options = {}) {
     };
   }
 
-  return { attach, attachRaw, enqueueSegment, info, setSampleRate };
+  return { attach, attachRaw, enqueueSegment, info, setSampleRate, subscribe };
 }

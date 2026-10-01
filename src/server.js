@@ -4,9 +4,10 @@ import { defaultProfilePath, buildVoiceProfile, inspectVoiceProfile, loadVoicePr
 import { encodeTelephony } from "./telephony.js";
 import { createSipController } from "./sip.js";
 import { createBroadcastEngine, float32ToPcm16 } from "./broadcast.js";
+import { createBroadcastJob, getBroadcastJob, patchBroadcastJob, recoverableBroadcastJobs, pruneBroadcastJobs, broadcastJobStoreInfo } from "./broadcast-job-store.js";
 
 for (const k of ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "ORT_NUM_THREADS"]) process.env[k] ||= "1";
-const VERSION = "0.6.5";
+const VERSION = "0.7.0";
 const PORT = Number(process.env.PORT || 3000);
 const API_KEY = process.env.TTS_API_KEY || "";
 const LANGUAGE = process.env.TTS_LANGUAGE || "hebrew";
@@ -22,11 +23,16 @@ const STT_MAX_AUDIO_BYTES = Number(process.env.STT_MAX_AUDIO_BYTES || 8 * 1024 *
 const STT_MAX_AUDIO_SECONDS = Number(process.env.STT_MAX_AUDIO_SECONDS || 120);
 const TELEPHONY_CODEC = String(process.env.TELEPHONY_CODEC || "pcmu").toLowerCase();
 const TELEPHONY_SAMPLE_RATE = Number(process.env.TELEPHONY_SAMPLE_RATE || 8000);
+const BROADCAST_TTS_DECODE_STEPS = Math.max(1, Number(process.env.BROADCAST_TTS_DECODE_STEPS || 1));
+const BROADCAST_TTS_CHUNK_CHARS = Math.max(30, Number(process.env.BROADCAST_TTS_CHUNK_CHARS || 120));
+const BROADCAST_JOB_RECOVERY_LIMIT = Math.max(1, Number(process.env.BROADCAST_JOB_RECOVERY_LIMIT || 50));
+const PROCESS_STARTED_AT = Date.now();
 const app = express(); app.disable("x-powered-by"); app.use(express.json({ limit: "64kb" }));
 const sip = createSipController();
 const broadcast = createBroadcastEngine();
 let tts=null,encodeWav=null,ttsLoadPromise=null,ttsStatus="idle",ttsStage="idle",ttsError=null,ttsInfo={},queueTail=Promise.resolve(),broadcastJobTail=Promise.resolve(),voiceBuildStatus="idle",voiceBuildStage="idle",voiceBuildError=null,voiceBuildInfo={};
-const broadcastJobs={active:0,completed:0,failed:0,lastId:null,lastStatus:null,lastError:null,lastStartedAt:null,lastFinishedAt:null};
+const broadcastJobs={active:0,completed:0,failed:0,recovered:0,lastId:null,lastStatus:null,lastError:null,lastStartedAt:null,lastFinishedAt:null};
+const scheduledBroadcastJobs=new Set();
 const customVoices=new Map(),wavCache=new Map(); let stt=null,sttModule=null,sttImportPromise=null,sttImportError=null;
 function sttInfo(){if(stt)return stt.info();return{status:sttImportError?"error":"idle",stage:sttImportError?"module-import-error":"idle",error:sttImportError||null,model:process.env.STT_MODEL||"Xenova/whisper-tiny",dtype:process.env.STT_DTYPE||"q8",language:process.env.STT_LANGUAGE||"hebrew",sampleRate:16000,loaded:false,idleUnloadMs:Number(process.env.STT_IDLE_UNLOAD_MS||60000)};}
 async function ensureStt(){if(stt&&sttModule)return{stt,mod:sttModule};if(sttImportPromise)return sttImportPromise;sttImportPromise=import("./stt.js").then(mod=>{sttModule=mod;stt=mod.createSttEngine();sttImportError=null;return{stt,mod};}).catch(error=>{stt=null;sttModule=null;sttImportError=error instanceof Error?`${error.name}: ${error.message}`:String(error);console.error("[STT] module import failed; TTS remains available:",error);throw error;}).finally(()=>{sttImportPromise=null;});return sttImportPromise;}
@@ -37,7 +43,7 @@ function voices(){const builtIn=Array.isArray(tts?.voices)?tts.voices:[];return[
 function resolveVoice(name){const requested=name||ttsInfo.defaultVoice||tts?.defaultVoice;if(customVoices.has(requested))return{name:requested,value:customVoices.get(requested)};if(tts?.voices?.includes(requested))return{name:requested,value:requested};throw new Error(`Unknown voice '${requested}'. Available: ${voices().join(", ")}`);}
 async function initTts(onEvent){if(tts)return tts;if(ttsLoadPromise)return ttsLoadPromise;ttsStatus="loading";ttsStage="importing-package";ttsError=null;onEvent?.({stage:"load-start",pid:process.pid});ttsLoadPromise=(async()=>{try{const mod=await import("pocket-tts-onnx");encodeWav=mod.encodeWav;ttsStage="loading-model";const options={language:LANGUAGE,onProgress:(stage,p={})=>{const total=Number(p.total||0),loaded=Number(p.loaded||0),percent=total?Math.floor(loaded/total*100):-1;if(percent<0||percent%10===0||percent===100)onEvent?.({stage:`model:${stage}`,loaded,total,percent});}};if(MODELS_URL)options.modelsUrl=MODELS_URL;tts=await mod.load(options);let defaultVoice=tts.defaultVoice;try{const prepared=await loadVoiceProfile(VOICE_PROFILE_FILE);customVoices.set(VOICE_NAME,prepared);defaultVoice=VOICE_NAME;}catch(e){if(REQUIRE_CUSTOM_VOICE)throw e;}ttsStatus="ready";ttsStage="ready";ttsInfo={sampleRate:tts.sampleRate,defaultVoice,customVoiceLoaded:customVoices.has(VOICE_NAME),voices:voices()};broadcast.setSampleRate(tts.sampleRate);onEvent?.({stage:"ready",...ttsInfo});console.log(`[TTS] ready sampleRate=${tts.sampleRate} defaultVoice=${defaultVoice}`);return tts;}catch(e){tts=null;customVoices.clear();ttsLoadPromise=null;ttsStatus="error";ttsStage="error";ttsError=e instanceof Error?`${e.name}: ${e.message}`:String(e);throw e;}})();return ttsLoadPromise;}
 function ndjson(res){res.status(200).set({"Content-Type":"application/x-ndjson; charset=utf-8","Cache-Control":"no-cache, no-store","X-Accel-Buffering":"no"});res.flushHeaders();return event=>{if(!res.writableEnded&&!res.destroyed){res.write(`${JSON.stringify({ok:event.stage!=="error",...event})}\n`);res.flush?.();}};}
-app.get("/health",(_req,res)=>res.json({ok:true,service:"aharon-voice-ai",version:VERSION,pid:process.pid,uptimeSec:Math.floor(process.uptime()),tts:{status:ttsStatus,stage:ttsStage,error:ttsError,...ttsInfo},stt:sttInfo(),voiceBuild:{status:voiceBuildStatus,stage:voiceBuildStage,error:voiceBuildError},sip:sip.info(),broadcast:broadcast.info(),broadcastJobs:{...broadcastJobs}}));
+app.get("/health",(_req,res)=>{const mem=process.memoryUsage();res.json({ok:true,service:"aharon-voice-ai",version:VERSION,pid:process.pid,startedAt:PROCESS_STARTED_AT,uptimeSec:Math.floor(process.uptime()),memoryMb:{rss:Number((mem.rss/1048576).toFixed(1)),heapUsed:Number((mem.heapUsed/1048576).toFixed(1)),external:Number((mem.external/1048576).toFixed(1))},tts:{status:ttsStatus,stage:ttsStage,error:ttsError,...ttsInfo},stt:sttInfo(),voiceBuild:{status:voiceBuildStatus,stage:voiceBuildStage,error:voiceBuildError},sip:sip.info(),broadcast:broadcast.info(),broadcastJobs:{...broadcastJobs,store:broadcastJobStoreInfo()}})});
 app.get("/ready",(_req,res)=>ttsStatus==="ready"?res.json({ok:true,ready:true,language:LANGUAGE,...ttsInfo}):res.status(503).json({ok:false,ready:false,status:ttsStatus,stage:ttsStage,error:ttsError||undefined}));
 app.get("/v1/voices",auth,(_req,res)=>ttsStatus==="ready"?res.json({ok:true,defaultVoice:ttsInfo.defaultVoice,customVoiceLoaded:ttsInfo.customVoiceLoaded,voices:ttsInfo.voices}):res.status(503).json({ok:false,error:"tts_not_ready",status:ttsStatus}));
 async function warmTts(_req,res){if(ttsStatus==="ready")return res.json({ok:true,ready:true,...ttsInfo});const write=ndjson(res);write({stage:"accepted",pid:process.pid});try{await initTts(write);write({stage:"complete",ready:true,...ttsInfo});}catch(e){write({stage:"error",error:e instanceof Error?`${e.name}: ${e.message}`:String(e)});}finally{if(!res.writableEnded)res.end();}}
@@ -56,13 +62,169 @@ app.post("/admin/sip/connect",auth,async(_req,res)=>{try{const state=await sip.c
 app.post("/admin/sip/disconnect",auth,async(_req,res)=>{try{res.json({ok:true,...(await sip.disconnect())});}catch(e){res.status(500).json({ok:false,error:"sip_disconnect_failed",message:e instanceof Error?e.message:String(e),sip:sip.info()});}});
 const rawAudio=express.raw({type:["audio/wav","audio/x-wav","audio/wave","application/octet-stream"],limit:STT_MAX_AUDIO_BYTES});
 app.post("/v1/stt",auth,rawAudio,async(req,res)=>{if(!Buffer.isBuffer(req.body))return res.status(415).json({ok:false,error:"unsupported_media_type"});let engine,mod,audio;try{({stt:engine,mod}=await ensureStt());const type=(req.get("content-type")||"").split(";")[0].toLowerCase();audio=mod.decodeSttAudio(req.body,{encoding:type.includes("wav")?"wav":String(req.query.encoding||"s16le"),sampleRate:Number(req.query.sample_rate||TELEPHONY_SAMPLE_RATE)});const simulateCodec=String(req.query.simulate_telephony||"").toLowerCase();if(simulateCodec){const encoded=encodeTelephony(audio.samples,audio.sampleRate,simulateCodec,TELEPHONY_SAMPLE_RATE);audio=mod.decodeSttAudio(encoded,{encoding:simulateCodec,sampleRate:TELEPHONY_SAMPLE_RATE});audio.simulatedTelephony={codec:simulateCodec,sampleRate:TELEPHONY_SAMPLE_RATE,bytes:encoded.length};}}catch(e){const message=e instanceof Error?`${e.name}: ${e.message}`:String(e),importFailure=Boolean(sttImportError);return res.status(importFailure?503:400).json({ok:false,error:importFailure?"stt_unavailable":"invalid_audio",message,stt:sttInfo()});}if(audio.durationSec>STT_MAX_AUDIO_SECONDS)return res.status(413).json({ok:false,error:"audio_too_long",maxSeconds:STT_MAX_AUDIO_SECONDS});try{const result=await enqueue(()=>engine.transcribe(audio.samples,{language:String(req.query.language||process.env.STT_LANGUAGE||"hebrew"),timestamps:req.query.timestamps!=="0"&&req.query.timestamps!=="false"}));res.json({ok:true,text:result.text,chunks:result.chunks,language:String(req.query.language||process.env.STT_LANGUAGE||"hebrew"),model:engine.info().model,durationSec:Number(audio.durationSec.toFixed(3)),sourceSampleRate:audio.sourceSampleRate,sampleRate:audio.sampleRate,simulatedTelephony:audio.simulatedTelephony,processingMs:result.processingMs});}catch(e){res.status(500).json({ok:false,error:"stt_failed",message:e instanceof Error?`${e.name}: ${e.message}`:String(e),stt:sttInfo()});}});
-app.get("/v1/broadcast/status",auth,(_req,res)=>res.json({ok:true,...broadcast.info()}));
-function queueBroadcastSegment(body,text){const id=typeof body?.id==="string"&&body.id.trim()?body.id.trim():`segment_${crypto.randomUUID()}`;const run=async()=>{const started=Date.now();broadcastJobs.active+=1;broadcastJobs.lastId=id;broadcastJobs.lastStatus="generating";broadcastJobs.lastError=null;broadcastJobs.lastStartedAt=started;try{if(ttsStatus!=="ready")await initTts();const voice=resolveVoice(typeof body?.voice==="string"?body.voice.trim():(typeof body?.speaker?.voice==="string"?body.speaker.voice.trim():""));const samples=await enqueue(()=>tts.speak(text,{voice:voice.value}));const queued=broadcast.enqueueSegment({id,pcm:float32ToPcm16(samples),sampleRate:tts.sampleRate,meta:{type:typeof body?.type==="string"?body.type:"news",priority:Number.isFinite(body?.priority)?Number(body.priority):50,voice:voice.name,speakerId:typeof body?.speaker?.id==="string"?body.speaker.id:null,eventId:typeof body?.source?.eventId==="string"?body.source.eventId:null,textPreview:text.slice(0,160)}});broadcastJobs.completed+=1;broadcastJobs.lastStatus="queued";broadcastJobs.lastFinishedAt=Date.now();console.log(`[BROADCAST] segment ready id=${id} voice=${voice.name} ms=${Date.now()-started} queue=${queued.queueLength}`);}catch(e){broadcastJobs.failed+=1;broadcastJobs.lastStatus="failed";broadcastJobs.lastError=e instanceof Error?`${e.name}: ${e.message}`:String(e);broadcastJobs.lastFinishedAt=Date.now();console.error(`[BROADCAST] segment failed id=${id}:`,broadcastJobs.lastError);}finally{broadcastJobs.active=Math.max(0,broadcastJobs.active-1);}};broadcastJobTail=broadcastJobTail.then(run,run);return id;}
-app.post("/v1/broadcast/segment",auth,(req,res)=>{const text=typeof req.body?.text==="string"?req.body.text.trim():(typeof req.body?.content?.text==="string"?req.body.content.text.trim():"");if(!text)return res.status(400).json({ok:false,error:"text is required"});if(text.length>MAX_TEXT_LENGTH)return res.status(413).json({ok:false,error:`text is too long; max ${MAX_TEXT_LENGTH}`});const id=queueBroadcastSegment(req.body||{},text);res.status(202).json({ok:true,accepted:true,id,status:"generating",broadcast:broadcast.info()});});
+app.get("/v1/broadcast/status",auth,(_req,res)=>res.json({ok:true,...broadcast.info(),jobs:{...broadcastJobs}}));
+
+function splitBroadcastText(text,maxChars=BROADCAST_TTS_CHUNK_CHARS){
+  const normalized=String(text||"").replace(/\s+/g," ").trim();
+  if(!normalized)return[];
+  const sentences=normalized.match(/[^.!?…]+(?:[.!?…]+|$)/g)?.map((part)=>part.trim()).filter(Boolean)||[normalized];
+  const chunks=[];
+  for(const sentence of sentences){
+    if(sentence.length<=maxChars){chunks.push(sentence);continue;}
+    const words=sentence.split(/\s+/);let current="";
+    for(const word of words){
+      if(!current){current=word;continue;}
+      if((current.length+1+word.length)<=maxChars){current+=" "+word;continue;}
+      chunks.push(current);current=word;
+    }
+    if(current)chunks.push(current);
+  }
+  return chunks;
+}
+
+function publicJob(job){
+  if(!job)return null;
+  const copy={...job};
+  delete copy.text;
+  copy.textPreview=typeof job.text==="string"?job.text.slice(0,160):undefined;
+  return copy;
+}
+
+function sanitizeBroadcastPayload(body,text,id){
+  const speakerId=typeof body?.speaker?.id==="string"?body.speaker.id:null;
+  const requestedVoice=typeof body?.voice==="string"&&body.voice.trim()?body.voice.trim():(typeof body?.speaker?.voice==="string"?body.speaker.voice.trim():"");
+  return{id,text,type:typeof body?.type==="string"?body.type:"news",priority:Number.isFinite(body?.priority)?Number(body.priority):50,voice:requestedVoice,speakerId,eventId:typeof body?.source?.eventId==="string"?body.source.eventId:null,language:typeof body?.content?.language==="string"?body.content.language:null,status:"pending",attempts:0,chunksQueued:0,playedChunks:0,totalChunks:0,lastError:null};
+}
+
+function noteJob(job){
+  if(!job)return;
+  broadcastJobs.lastId=job.id;
+  broadcastJobs.lastStatus=job.status;
+  broadcastJobs.lastError=job.lastError||null;
+  if(job.startedAt)broadcastJobs.lastStartedAt=job.startedAt;
+  if(job.finishedAt||job.playedAt)broadcastJobs.lastFinishedAt=job.finishedAt||job.playedAt;
+}
+
+async function processBroadcastJob(job){
+  const id=job.id;
+  const started=Date.now();
+  broadcastJobs.active+=1;
+  broadcastJobs.lastId=id;
+  broadcastJobs.lastStatus="generating";
+  broadcastJobs.lastError=null;
+  broadcastJobs.lastStartedAt=started;
+  let current=patchBroadcastJob(id,{status:"generating",startedAt:started,attempts:Number(job.attempts||0)+1,lastError:null,pid:process.pid,chunksQueued:0,playedChunks:0});
+  try{
+    if(ttsStatus!=="ready")await initTts();
+    const voice=resolveVoice(current?.voice||"");
+    const chunks=splitBroadcastText(current?.text||job.text);
+    if(!chunks.length)throw new Error("Broadcast text produced no TTS chunks");
+    current=patchBroadcastJob(id,{totalChunks:chunks.length,voiceResolved:voice.name,status:"generating"});
+    for(let index=0;index<chunks.length;index+=1){
+      const chunkText=chunks[index];
+      const chunkStarted=Date.now();
+      const samples=await enqueue(()=>tts.speak(chunkText,{voice:voice.value,decodeSteps:BROADCAST_TTS_DECODE_STEPS}));
+      const pcm=float32ToPcm16(samples);
+      const segmentId=id+"::"+(index+1)+"/"+chunks.length;
+      const queued=broadcast.enqueueSegment({id:segmentId,pcm,sampleRate:tts.sampleRate,meta:{type:current?.type||"news",priority:Number.isFinite(current?.priority)?Number(current.priority):50,voice:voice.name,speakerId:current?.speakerId||null,eventId:current?.eventId||null,parentJobId:id,chunkIndex:index+1,chunkTotal:chunks.length,textPreview:chunkText.slice(0,160)}});
+      current=patchBroadcastJob(id,{status:index+1<chunks.length?"streaming":"queued",chunksQueued:index+1,totalChunks:chunks.length,lastChunkQueuedAt:Date.now(),generationMs:Number((current?.generationMs||0)+(Date.now()-chunkStarted))});
+      noteJob(current);
+      console.log("[BROADCAST] chunk ready job="+id+" chunk="+(index+1)+"/"+chunks.length+" voice="+voice.name+" ms="+(Date.now()-chunkStarted)+" queue="+queued.queueLength);
+    }
+    console.log("[BROADCAST] generation complete id="+id+" voice="+voice.name+" ms="+(Date.now()-started)+" chunks="+chunks.length);
+  }catch(e){
+    const error=e instanceof Error?e.name+": "+e.message:String(e);
+    broadcastJobs.failed+=1;
+    current=patchBroadcastJob(id,{status:"failed",lastError:error,finishedAt:Date.now()});
+    noteJob(current);
+    console.error("[BROADCAST] job failed id="+id+":",error);
+  }finally{
+    broadcastJobs.active=Math.max(0,broadcastJobs.active-1);
+    scheduledBroadcastJobs.delete(id);
+  }
+}
+
+function scheduleBroadcastJob(job,{recovered=false}={}){
+  if(!job?.id||scheduledBroadcastJobs.has(job.id))return false;
+  scheduledBroadcastJobs.add(job.id);
+  if(recovered){
+    const previousStatus=job.status;
+    broadcastJobs.recovered+=1;
+    const reset=patchBroadcastJob(job.id,{status:"pending",recoveredAt:Date.now(),lastError:null});
+    if(reset)job=reset;
+    console.log("[BROADCAST] recovering job id="+job.id+" previousStatus="+previousStatus);
+  }
+  const run=()=>processBroadcastJob(job);
+  broadcastJobTail=broadcastJobTail.then(run,run);
+  return true;
+}
+
+broadcast.subscribe((event)=>{
+  const parentId=event?.segment?.meta?.parentJobId;
+  if(!parentId)return;
+  const existing=getBroadcastJob(parentId);
+  if(!existing)return;
+  if(event.type==="started"){
+    noteJob(patchBroadcastJob(parentId,{status:"playing",lastPlaybackStartedAt:event.at}));
+    return;
+  }
+  if(event.type==="finished"){
+    const played=Math.min(Number(existing.totalChunks||1),Number(existing.playedChunks||0)+1);
+    const done=played>=Number(existing.totalChunks||1);
+    const patch={playedChunks:played,status:done?"completed":"playing",lastPlaybackFinishedAt:event.at};
+    if(done){patch.playedAt=event.at;patch.finishedAt=event.at;}
+    const updated=patchBroadcastJob(parentId,patch);
+    if(done){
+      broadcastJobs.completed+=1;
+      pruneBroadcastJobs();
+      console.log("[BROADCAST] job completed id="+parentId+" chunks="+played);
+    }
+    noteJob(updated);
+  }
+});
+
+app.get("/v1/broadcast/jobs/:id",auth,(req,res)=>{
+  const job=getBroadcastJob(String(req.params.id||""));
+  if(!job)return res.status(404).json({ok:false,error:"broadcast_job_not_found"});
+  res.json({ok:true,job:publicJob(job)});
+});
+
+app.post("/v1/broadcast/segment",auth,(req,res)=>{
+  const text=typeof req.body?.text==="string"?req.body.text.trim():(typeof req.body?.content?.text==="string"?req.body.content.text.trim():"");
+  if(!text)return res.status(400).json({ok:false,error:"text is required"});
+  if(text.length>MAX_TEXT_LENGTH)return res.status(413).json({ok:false,error:"text is too long; max "+MAX_TEXT_LENGTH});
+  const id=typeof req.body?.id==="string"&&req.body.id.trim()?req.body.id.trim():"segment_"+crypto.randomUUID();
+  if(id.length>200)return res.status(400).json({ok:false,error:"id is too long"});
+  const payload=sanitizeBroadcastPayload(req.body||{},text,id);
+  const created=createBroadcastJob(payload);
+  if(!created.created){
+    const existing=created.job;
+    if(existing.text!==text)return res.status(409).json({ok:false,error:"broadcast_job_id_conflict",id,status:existing.status});
+    if(existing.status==="failed"){
+      const retry=patchBroadcastJob(id,{status:"pending",lastError:null,playedChunks:0,chunksQueued:0,totalChunks:0});
+      scheduleBroadcastJob(retry);
+      return res.status(202).json({ok:true,accepted:true,retried:true,id,status:"pending",job:publicJob(retry),broadcast:broadcast.info()});
+    }
+    return res.status(existing.status==="completed"?200:202).json({ok:true,accepted:existing.status!=="completed",duplicate:true,id,status:existing.status,job:publicJob(existing),broadcast:broadcast.info()});
+  }
+  scheduleBroadcastJob(created.job);
+  res.status(202).json({ok:true,accepted:true,id,status:"pending",job:publicJob(created.job),broadcast:broadcast.info()});
+});
+
 app.post("/v1/broadcast/test-tone",auth,(req,res)=>{const info=broadcast.info();const rate=Number(info.sampleRate||24000);const seconds=Math.max(0.5,Math.min(5,Number(req.body?.seconds||2)));const frequency=Math.max(220,Math.min(2000,Number(req.body?.frequency||880)));const frames=Math.round(rate*seconds);const pcm=Buffer.allocUnsafe(frames*2);for(let i=0;i<frames;i++){const fade=Math.min(1,i/(rate*0.02),(frames-i-1)/(rate*0.02));const sample=Math.sin(2*Math.PI*frequency*i/rate)*0.22*Math.max(0,fade);pcm.writeInt16LE(Math.round(sample*32767),i*2);}const id=`tone_${Date.now()}`;const queued=broadcast.enqueueSegment({id,pcm,sampleRate:rate,meta:{type:"test-tone",priority:100,voice:null,speakerId:"diagnostic",eventId:null,textPreview:`${frequency}Hz test tone`}});res.status(202).json({ok:true,accepted:true,id,seconds,frequency,sampleRate:rate,queued,broadcast:broadcast.info()});});
 app.get("/live.wav",async(_req,res)=>{try{if(ttsStatus!=="ready")await initTts();broadcast.attach(res);}catch(e){if(!res.headersSent)res.status(503).json({ok:false,error:"broadcast_unavailable",message:e instanceof Error?`${e.name}: ${e.message}`:String(e)});else try{res.end();}catch{}}});
 app.get("/live.pcm",async(_req,res)=>{try{if(ttsStatus!=="ready")await initTts();broadcast.attachRaw(res);}catch(e){if(!res.headersSent)res.status(503).json({ok:false,error:"broadcast_unavailable",message:e instanceof Error?`${e.name}: ${e.message}`:String(e)});else try{res.end();}catch{}}});
-app.get("/radio",(_req,res)=>res.type("html").send("<!doctype html><html lang=\"he\" dir=\"rtl\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Aharon AI Radio</title><style>body{font-family:system-ui;background:#111;color:#eee;max-width:760px;margin:50px auto;padding:20px}main{background:#1c1c1c;padding:28px;border-radius:18px}button{font:inherit;padding:12px 20px;border:0;border-radius:12px;cursor:pointer}#state{margin:14px 0}pre{background:#090909;padding:14px;border-radius:12px;white-space:pre-wrap;overflow:auto}</style></head><body><main><h1>📻 Aharon AI Radio</h1><p>שידור AI חי באמצעות PCM ישיר לדפדפן.</p><button id=\"play\">▶ התחל שידור</button><div id=\"state\">מוכן להתחבר</div><pre id=\"s\">טוען מצב...</pre></main><script>\nlet ctx=null,processor=null,running=false,aborter=null;\nlet chunks=[],chunkOffset=0,bufferedSamples=0,inputRate=24000;\nconst play=document.getElementById('play'),state=document.getElementById('state'),statusBox=document.getElementById('s');\nfunction enqueueSamples(arr){if(!arr.length)return;chunks.push(arr);bufferedSamples+=arr.length;const max=Math.max(inputRate*5,inputRate);while(bufferedSamples>max&&chunks.length>1){const first=chunks.shift();bufferedSamples-=Math.max(0,first.length-chunkOffset);chunkOffset=0;}}\nfunction pullInput(){while(chunks.length){const c=chunks[0];if(chunkOffset<c.length){const v=c[chunkOffset++];bufferedSamples--;if(chunkOffset>=c.length){chunks.shift();chunkOffset=0}return v;}chunks.shift();chunkOffset=0;}return 0;}\nfunction installProcessor(){processor=ctx.createScriptProcessor(4096,0,1);let a=0,b=0,have=false,phase=0;processor.onaudioprocess=e=>{const out=e.outputBuffer.getChannelData(0);const ratio=inputRate/ctx.sampleRate;for(let i=0;i<out.length;i++){if(!have){a=pullInput();b=pullInput();have=true}out[i]=a+(b-a)*phase;phase+=ratio;while(phase>=1){phase-=1;a=b;b=pullInput();}}};processor.connect(ctx.destination);}\nasync function status(){try{const r=await fetch('/health',{cache:'no-store'});const j=await r.json();statusBox.textContent=JSON.stringify({...j.broadcast,broadcastJobs:j.broadcastJobs,browserSampleRate:ctx?.sampleRate||null,bufferedMs:inputRate?Math.round(bufferedSamples/inputRate*1000):0},null,2)}catch(e){statusBox.textContent=String(e)}}\nasync function start(){if(running)return;running=true;play.disabled=true;state.textContent='מתחבר לשידור...';try{ctx=new (window.AudioContext||window.webkitAudioContext)();await ctx.resume();aborter=new AbortController();const response=await fetch('/live.pcm',{cache:'no-store',signal:aborter.signal});if(!response.ok||!response.body)throw new Error('stream HTTP '+response.status);inputRate=Number(response.headers.get('X-Audio-Sample-Rate'))||24000;installProcessor();const reader=response.body.getReader();let carry=null;state.textContent='מחובר • מאזין לשידור';play.textContent='● מחובר';while(running){const part=await reader.read();if(part.done)break;let bytes=part.value;if(carry!==null){const merged=new Uint8Array(bytes.length+1);merged[0]=carry;merged.set(bytes,1);bytes=merged;carry=null}if(bytes.length%2){carry=bytes[bytes.length-1];bytes=bytes.subarray(0,bytes.length-1)}if(!bytes.length)continue;const frames=bytes.length/2;const samples=new Float32Array(frames);const view=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength);for(let i=0;i<frames;i++)samples[i]=view.getInt16(i*2,true)/32768;enqueueSamples(samples);}}catch(e){if(running){state.textContent='שגיאת שידור: '+e.message;play.disabled=false;play.textContent='נסה שוב'}}finally{running=false}}\nplay.addEventListener('click',start);status();setInterval(status,3000);\n</script></body></html>"));
+app.get("/radio",(_req,res)=>res.type("html").send("<!doctype html><html lang=\"he\" dir=\"rtl\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Aharon AI Radio</title><style>body{font-family:system-ui;background:#111;color:#eee;max-width:760px;margin:50px auto;padding:20px}main{background:#1c1c1c;padding:28px;border-radius:18px}button{font:inherit;padding:12px 20px;border:0;border-radius:12px;cursor:pointer}#state{margin:14px 0}pre{background:#090909;padding:14px;border-radius:12px;white-space:pre-wrap;overflow:auto}</style></head><body><main><h1>📻 Aharon AI Radio</h1><p>שידור AI חי באמצעות PCM ישיר לדפדפן, עם חיבור מחדש אוטומטי.</p><button id=\"play\">▶ התחל שידור</button><div id=\"state\">מוכן להתחבר</div><pre id=\"s\">טוען מצב...</pre></main><script>\nlet ctx=null,processor=null,running=false,aborter=null;\nlet chunks=[],chunkOffset=0,bufferedSamples=0,inputRate=24000;\nconst sleep=ms=>new Promise(r=>setTimeout(r,ms));\nconst play=document.getElementById('play'),state=document.getElementById('state'),statusBox=document.getElementById('s');\nfunction enqueueSamples(arr){if(!arr.length)return;chunks.push(arr);bufferedSamples+=arr.length;const max=Math.max(inputRate*5,inputRate);while(bufferedSamples>max&&chunks.length>1){const first=chunks.shift();bufferedSamples-=Math.max(0,first.length-chunkOffset);chunkOffset=0;}}\nfunction pullInput(){while(chunks.length){const c=chunks[0];if(chunkOffset<c.length){const v=c[chunkOffset++];bufferedSamples--;if(chunkOffset>=c.length){chunks.shift();chunkOffset=0}return v;}chunks.shift();chunkOffset=0;}return 0;}\nfunction installProcessor(){if(processor)return;processor=ctx.createScriptProcessor(4096,0,1);let a=0,b=0,have=false,phase=0;processor.onaudioprocess=e=>{const out=e.outputBuffer.getChannelData(0);const ratio=inputRate/ctx.sampleRate;for(let i=0;i<out.length;i++){if(!have){a=pullInput();b=pullInput();have=true}out[i]=a+(b-a)*phase;phase+=ratio;while(phase>=1){phase-=1;a=b;b=pullInput();}}};processor.connect(ctx.destination);}\nasync function status(){try{const r=await fetch('/health',{cache:'no-store'});const j=await r.json();statusBox.textContent=JSON.stringify({...j.broadcast,broadcastJobs:j.broadcastJobs,browserSampleRate:ctx?.sampleRate||null,bufferedMs:inputRate?Math.round(bufferedSamples/inputRate*1000):0},null,2)}catch(e){statusBox.textContent=String(e)}}\nasync function consume(response){inputRate=Number(response.headers.get('X-Audio-Sample-Rate'))||24000;installProcessor();const reader=response.body.getReader();let carry=null;state.textContent='מחובר • מאזין לשידור';play.textContent='● מחובר';while(running){const part=await reader.read();if(part.done)throw new Error('stream ended');let bytes=part.value;if(carry!==null){const merged=new Uint8Array(bytes.length+1);merged[0]=carry;merged.set(bytes,1);bytes=merged;carry=null}if(bytes.length%2){carry=bytes[bytes.length-1];bytes=bytes.subarray(0,bytes.length-1)}if(!bytes.length)continue;const frames=bytes.length/2;const samples=new Float32Array(frames);const view=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength);for(let i=0;i<frames;i++)samples[i]=view.getInt16(i*2,true)/32768;enqueueSamples(samples);}}\nasync function start(){if(running)return;running=true;play.disabled=true;ctx=new (window.AudioContext||window.webkitAudioContext)();await ctx.resume();installProcessor();while(running){try{state.textContent='מתחבר לשידור...';aborter=new AbortController();const response=await fetch('/live.pcm?ts='+Date.now(),{cache:'no-store',signal:aborter.signal});if(!response.ok||!response.body)throw new Error('stream HTTP '+response.status);await consume(response);}catch(e){if(!running)break;state.textContent='החיבור נותק • מתחבר מחדש...';chunks=[];chunkOffset=0;bufferedSamples=0;await sleep(1000);}}play.disabled=false;play.textContent='▶ התחל שידור';}\nplay.addEventListener('click',()=>start().catch(e=>{running=false;state.textContent='שגיאת שידור: '+e.message;play.disabled=false;play.textContent='נסה שוב'}));\nstatus();setInterval(status,3000);\n</script></body></html>"));
 app.post("/v1/tts",auth,async(req,res)=>{const text=typeof req.body?.text==="string"?req.body.text.trim():"";if(!text)return res.status(400).json({ok:false,error:"text is required"});if(text.length>MAX_TEXT_LENGTH)return res.status(413).json({ok:false,error:`text is too long; max ${MAX_TEXT_LENGTH}`});try{if(ttsStatus!=="ready")await initTts();}catch(e){return res.status(503).json({ok:false,error:"tts_unavailable",message:e instanceof Error?`${e.name}: ${e.message}`:String(e)});}let voice;try{voice=resolveVoice(typeof req.body?.voice==="string"?req.body.voice.trim():"");}catch(e){return res.status(400).json({ok:false,error:"unknown_voice",message:e.message});}const temperature=Number.isFinite(req.body?.temperature)?Number(req.body.temperature):undefined,decodeSteps=Number.isInteger(req.body?.decodeSteps)?Number(req.body.decodeSteps):undefined,seed=Number.isInteger(req.body?.seed)?Number(req.body.seed):undefined,format=String(req.body?.format||"wav").toLowerCase(),outputRate=Number(req.body?.sampleRate||(format==="wav"?tts.sampleRate:TELEPHONY_SAMPLE_RATE));if(!["wav","pcmu","mulaw","ulaw","pcma","alaw"].includes(format))return res.status(400).json({ok:false,error:"unsupported_output_format",formats:["wav","pcmu","pcma"]});if(format!=="wav"&&outputRate!==8000&&outputRate!==16000)return res.status(400).json({ok:false,error:"unsupported_telephony_sample_rate",sampleRates:[8000,16000]});const normalizedFormat=["mulaw","ulaw"].includes(format)?"pcmu":(format==="alaw"?"pcma":format),key=crypto.createHash("sha256").update(JSON.stringify({text,voice:voice.name,temperature,decodeSteps,seed,format:normalizedFormat,outputRate,LANGUAGE,VERSION})).digest("hex"),hit=wavCache.get(key),headersFor=(buffer,cacheState)=>({"Content-Type":normalizedFormat==="wav"?"audio/wav":"application/octet-stream","Content-Length":String(buffer.length),"Content-Disposition":normalizedFormat==="wav"?'inline; filename="speech.wav"':`inline; filename="speech.${normalizedFormat}"`,"Cache-Control":"no-store","X-TTS-Cache":cacheState,"X-TTS-Voice":voice.name,"X-Audio-Codec":normalizedFormat,"X-Audio-Sample-Rate":String(normalizedFormat==="wav"?tts.sampleRate:outputRate)});if(hit)return res.set(headersFor(hit,"HIT")).end(hit);try{const audio=await enqueue(async()=>{const options={voice:voice.value};if(temperature!==undefined)options.temperature=temperature;if(decodeSteps!==undefined)options.decodeSteps=decodeSteps;if(seed!==undefined)options.seed=seed;const samples=await tts.speak(text,options);if(normalizedFormat==="wav")return Buffer.from(encodeWav(samples,tts.sampleRate));return encodeTelephony(samples,tts.sampleRate,normalizedFormat,outputRate);});cacheSet(key,audio);res.set(headersFor(audio,"MISS")).end(audio);}catch(e){res.status(500).json({ok:false,error:"tts_generation_failed",message:e instanceof Error?`${e.name}: ${e.message}`:String(e)});}});
 app.use((err,_req,res,_next)=>{console.error(err);if(err?.type==="entity.parse.failed")return res.status(400).json({ok:false,error:"invalid_json"});if(err?.type==="entity.too.large")return res.status(413).json({ok:false,error:"payload_too_large"});res.status(500).json({ok:false,error:"internal_server_error"});});
-app.listen(PORT,"0.0.0.0",()=>{console.log(`Aharon Voice AI v${VERSION} listening on 0.0.0.0:${PORT}`);const si=sttInfo();console.log(`TTS=${LANGUAGE}/${VOICE_NAME}; STT=${si.model}/${si.dtype}/${si.language} (lazy)`);console.log(`Voice profile: ${VOICE_PROFILE_FILE}`);console.log(`Telephony=${TELEPHONY_CODEC}/${TELEPHONY_SAMPLE_RATE}Hz; SIP=${sip.info().configured?"configured":"disabled"}`);if(sip.info().autoConnect&&sip.info().configured){sip.connect().catch(error=>console.error("[SIP] auto-connect failed:",error instanceof Error?error.message:String(error)));}});
+app.listen(PORT,"0.0.0.0",()=>{
+  console.log("Aharon Voice AI v"+VERSION+" listening on 0.0.0.0:"+PORT+" pid="+process.pid);
+  const si=sttInfo();
+  console.log("TTS="+LANGUAGE+"/"+VOICE_NAME+"; STT="+si.model+"/"+si.dtype+"/"+si.language+" (lazy)");
+  console.log("Voice profile: "+VOICE_PROFILE_FILE);
+  console.log("Telephony="+TELEPHONY_CODEC+"/"+TELEPHONY_SAMPLE_RATE+"Hz; SIP="+(sip.info().configured?"configured":"disabled"));
+  const recoverable=recoverableBroadcastJobs(BROADCAST_JOB_RECOVERY_LIMIT);
+  for(const job of recoverable)scheduleBroadcastJob(job,{recovered:true});
+  if(recoverable.length)console.log("[BROADCAST] scheduled "+recoverable.length+" persisted job(s) for recovery");
+  if(sip.info().autoConnect&&sip.info().configured){sip.connect().catch(error=>console.error("[SIP] auto-connect failed:",error instanceof Error?error.message:String(error)));}
+});

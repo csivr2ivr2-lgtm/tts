@@ -5,6 +5,21 @@ import os from "node:os";
 process.env.STT_MODEL ||= "Xenova/whisper-base";
 process.env.STT_DTYPE ||= "q8";
 
+const formatError = (value) => value instanceof Error ? value.name + ": " + value.message + "\n" + (value.stack || "") : String(value);
+process.on("uncaughtExceptionMonitor", (error, origin) => {
+  console.error("[PROCESS] uncaughtException origin=" + origin + " pid=" + process.pid + " " + formatError(error));
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[PROCESS] unhandledRejection pid=" + process.pid + " " + formatError(reason));
+});
+for (const signal of ["SIGTERM", "SIGINT"]) {
+  process.once(signal, () => {
+    const mem = process.memoryUsage();
+    console.log("[PROCESS] signal=" + signal + " pid=" + process.pid + " rssMb=" + (mem.rss / 1048576).toFixed(1));
+    process.exit(0);
+  });
+}
+
 const sipLogFile = process.env.SIP_LOG_FILE || path.join(os.homedir(), ".cache", "aharon-tts", "sip-events.log");
 fs.mkdirSync(path.dirname(sipLogFile), { recursive: true });
 
