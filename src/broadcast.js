@@ -1,6 +1,6 @@
 const DEFAULT_CHUNK_MS = Number(process.env.BROADCAST_CHUNK_MS || 100);
 const DEFAULT_GAP_MS = Number(process.env.BROADCAST_GAP_MS || 120);
-const MAX_QUEUE_SEGMENTS = Number(process.env.BROADCAST_MAX_QUEUE_SEGMENTS || 50);
+const MAX_QUEUE_SEGMENTS = Number(process.env.BROADCAST_MAX_QUEUE_SEGMENTS || 250);
 
 function clampPcm16(sample) {
   const x = Math.max(-1, Math.min(1, Number(sample) || 0));
@@ -138,7 +138,7 @@ export function createBroadcastEngine(options = {}) {
 
     if (currentOffset >= current.pcm.length) {
       if (!current.gapAppended) {
-        const gapBytes = Math.round((sampleRate * gapMs) / 1000) * 2;
+        const segmentGapMs = Number.isFinite(Number(current.meta?.gapMs)) ? Math.max(0, Number(current.meta.gapMs)) : gapMs;\n        const gapBytes = Math.round((sampleRate * segmentGapMs) / 1000) * 2;
         current.gapAppended = true;
         if (gapBytes > 0) current.pcm = Buffer.concat([current.pcm, Buffer.alloc(gapBytes)]);
       }

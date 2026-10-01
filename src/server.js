@@ -7,7 +7,7 @@ import { createBroadcastEngine, float32ToPcm16 } from "./broadcast.js";
 import { createBroadcastJob, getBroadcastJob, patchBroadcastJob, recoverableBroadcastJobs, pruneBroadcastJobs, broadcastJobStoreInfo } from "./broadcast-job-store.js";
 
 for (const k of ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "ORT_NUM_THREADS"]) process.env[k] ||= "1";
-const VERSION = "0.7.0";
+const VERSION = "0.8.0";
 const PORT = Number(process.env.PORT || 3000);
 const API_KEY = process.env.TTS_API_KEY || "";
 const LANGUAGE = process.env.TTS_LANGUAGE || "hebrew";
@@ -24,7 +24,7 @@ const STT_MAX_AUDIO_SECONDS = Number(process.env.STT_MAX_AUDIO_SECONDS || 120);
 const TELEPHONY_CODEC = String(process.env.TELEPHONY_CODEC || "pcmu").toLowerCase();
 const TELEPHONY_SAMPLE_RATE = Number(process.env.TELEPHONY_SAMPLE_RATE || 8000);
 const BROADCAST_TTS_DECODE_STEPS = Math.max(1, Number(process.env.BROADCAST_TTS_DECODE_STEPS || 1));
-const BROADCAST_TTS_CHUNK_CHARS = Math.max(30, Number(process.env.BROADCAST_TTS_CHUNK_CHARS || 120));
+const BROADCAST_STREAM_BATCH_FRAMES = Math.max(1, Number(process.env.BROADCAST_STREAM_BATCH_FRAMES || 10));
 const BROADCAST_JOB_RECOVERY_LIMIT = Math.max(1, Number(process.env.BROADCAST_JOB_RECOVERY_LIMIT || 50));
 const PROCESS_STARTED_AT = Date.now();
 const app = express(); app.disable("x-powered-by"); app.use(express.json({ limit: "64kb" }));
@@ -64,24 +64,6 @@ const rawAudio=express.raw({type:["audio/wav","audio/x-wav","audio/wave","applic
 app.post("/v1/stt",auth,rawAudio,async(req,res)=>{if(!Buffer.isBuffer(req.body))return res.status(415).json({ok:false,error:"unsupported_media_type"});let engine,mod,audio;try{({stt:engine,mod}=await ensureStt());const type=(req.get("content-type")||"").split(";")[0].toLowerCase();audio=mod.decodeSttAudio(req.body,{encoding:type.includes("wav")?"wav":String(req.query.encoding||"s16le"),sampleRate:Number(req.query.sample_rate||TELEPHONY_SAMPLE_RATE)});const simulateCodec=String(req.query.simulate_telephony||"").toLowerCase();if(simulateCodec){const encoded=encodeTelephony(audio.samples,audio.sampleRate,simulateCodec,TELEPHONY_SAMPLE_RATE);audio=mod.decodeSttAudio(encoded,{encoding:simulateCodec,sampleRate:TELEPHONY_SAMPLE_RATE});audio.simulatedTelephony={codec:simulateCodec,sampleRate:TELEPHONY_SAMPLE_RATE,bytes:encoded.length};}}catch(e){const message=e instanceof Error?`${e.name}: ${e.message}`:String(e),importFailure=Boolean(sttImportError);return res.status(importFailure?503:400).json({ok:false,error:importFailure?"stt_unavailable":"invalid_audio",message,stt:sttInfo()});}if(audio.durationSec>STT_MAX_AUDIO_SECONDS)return res.status(413).json({ok:false,error:"audio_too_long",maxSeconds:STT_MAX_AUDIO_SECONDS});try{const result=await enqueue(()=>engine.transcribe(audio.samples,{language:String(req.query.language||process.env.STT_LANGUAGE||"hebrew"),timestamps:req.query.timestamps!=="0"&&req.query.timestamps!=="false"}));res.json({ok:true,text:result.text,chunks:result.chunks,language:String(req.query.language||process.env.STT_LANGUAGE||"hebrew"),model:engine.info().model,durationSec:Number(audio.durationSec.toFixed(3)),sourceSampleRate:audio.sourceSampleRate,sampleRate:audio.sampleRate,simulatedTelephony:audio.simulatedTelephony,processingMs:result.processingMs});}catch(e){res.status(500).json({ok:false,error:"stt_failed",message:e instanceof Error?`${e.name}: ${e.message}`:String(e),stt:sttInfo()});}});
 app.get("/v1/broadcast/status",auth,(_req,res)=>res.json({ok:true,...broadcast.info(),jobs:{...broadcastJobs}}));
 
-function splitBroadcastText(text,maxChars=BROADCAST_TTS_CHUNK_CHARS){
-  const normalized=String(text||"").replace(/\s+/g," ").trim();
-  if(!normalized)return[];
-  const sentences=normalized.match(/[^.!?…]+(?:[.!?…]+|$)/g)?.map((part)=>part.trim()).filter(Boolean)||[normalized];
-  const chunks=[];
-  for(const sentence of sentences){
-    if(sentence.length<=maxChars){chunks.push(sentence);continue;}
-    const words=sentence.split(/\s+/);let current="";
-    for(const word of words){
-      if(!current){current=word;continue;}
-      if((current.length+1+word.length)<=maxChars){current+=" "+word;continue;}
-      chunks.push(current);current=word;
-    }
-    if(current)chunks.push(current);
-  }
-  return chunks;
-}
-
 function publicJob(job){
   if(!job)return null;
   const copy={...job};
@@ -113,29 +95,78 @@ async function processBroadcastJob(job){
   broadcastJobs.lastStatus="generating";
   broadcastJobs.lastError=null;
   broadcastJobs.lastStartedAt=started;
-  let current=patchBroadcastJob(id,{status:"generating",startedAt:started,attempts:Number(job.attempts||0)+1,lastError:null,pid:process.pid,chunksQueued:0,playedChunks:0});
+  let current=patchBroadcastJob(id,{status:"generating",startedAt:started,attempts:Number(job.attempts||0)+1,lastError:null,pid:process.pid,chunksQueued:0,playedChunks:0,totalChunks:0,firstAudioAt:null,timeToFirstAudioMs:null,ttsStatus:"starting"});
   try{
     if(ttsStatus!=="ready")await initTts();
     const voice=resolveVoice(current?.voice||"");
-    const chunks=splitBroadcastText(current?.text||job.text);
-    if(!chunks.length)throw new Error("Broadcast text produced no TTS chunks");
-    current=patchBroadcastJob(id,{totalChunks:chunks.length,voiceResolved:voice.name,status:"generating"});
-    for(let index=0;index<chunks.length;index+=1){
-      const chunkText=chunks[index];
-      const chunkStarted=Date.now();
-      const samples=await enqueue(()=>tts.speak(chunkText,{voice:voice.value,decodeSteps:BROADCAST_TTS_DECODE_STEPS}));
-      const pcm=float32ToPcm16(samples);
-      const segmentId=id+"::"+(index+1)+"/"+chunks.length;
-      const queued=broadcast.enqueueSegment({id:segmentId,pcm,sampleRate:tts.sampleRate,meta:{type:current?.type||"news",priority:Number.isFinite(current?.priority)?Number(current.priority):50,voice:voice.name,speakerId:current?.speakerId||null,eventId:current?.eventId||null,parentJobId:id,chunkIndex:index+1,chunkTotal:chunks.length,textPreview:chunkText.slice(0,160)}});
-      current=patchBroadcastJob(id,{status:index+1<chunks.length?"streaming":"queued",chunksQueued:index+1,totalChunks:chunks.length,lastChunkQueuedAt:Date.now(),generationMs:Number((current?.generationMs||0)+(Date.now()-chunkStarted))});
+    const baseMeta={type:current?.type||"news",priority:Number.isFinite(current?.priority)?Number(current.priority):50,voice:voice.name,speakerId:current?.speakerId||null,eventId:current?.eventId||null,parentJobId:id};
+    let buffers=[];
+    let audioParts=0;
+    let frameCount=0;
+    let firstFrameAt=null;
+    const queueAudioPart=()=>{
+      if(!buffers.length)return;
+      const pcm=Buffer.concat(buffers);
+      buffers=[];
+      audioParts+=1;
+      const segmentId=id+"::audio-"+audioParts;
+      const queued=broadcast.enqueueSegment({id:segmentId,pcm,sampleRate:tts.sampleRate,meta:{...baseMeta,streamPart:audioParts,finalJobPart:false,gapMs:0}});
+      const existing=getBroadcastJob(id)||current;
+      const status=existing?.status==="playing"?"playing":"streaming";
+      current=patchBroadcastJob(id,{status,chunksQueued:audioParts,lastChunkQueuedAt:Date.now(),firstAudioAt:firstFrameAt,timeToFirstAudioMs:firstFrameAt?firstFrameAt-started:null,ttsStatus:"streaming"});
       noteJob(current);
-      console.log("[BROADCAST] chunk ready job="+id+" chunk="+(index+1)+"/"+chunks.length+" voice="+voice.name+" ms="+(Date.now()-chunkStarted)+" queue="+queued.queueLength);
+      console.log("[BROADCAST] audio ready job="+id+" part="+audioParts+" frames="+frameCount+" queue="+queued.queueLength+" elapsedMs="+(Date.now()-started));
+    };
+    const streamOptions={
+      voice:voice.value,
+      decodeSteps:BROADCAST_TTS_DECODE_STEPS,
+      onStatus:(status)=>{
+        const existing=getBroadcastJob(id);
+        if(existing&&!["completed","failed"].includes(existing.status))current=patchBroadcastJob(id,{ttsStatus:String(status||"")});
+        console.log("[BROADCAST] tts status job="+id+" status="+String(status||""));
+      },
+      onProgress:(stage,progress={})=>{
+        const total=Number(progress.total||0),loaded=Number(progress.loaded||0);
+        const percent=total?Math.floor(loaded/total*100):-1;
+        if(percent<0||percent===100||percent%25===0)console.log("[BROADCAST] tts progress job="+id+" stage="+stage+" percent="+percent);
+      }
+    };
+    if(typeof tts.stream==="function"){
+      await enqueue(async()=>{
+        for await(const frame of tts.stream(current?.text||job.text,streamOptions)){
+          if(!(frame instanceof Float32Array)||frame.length===0)continue;
+          if(firstFrameAt===null){
+            firstFrameAt=Date.now();
+            current=patchBroadcastJob(id,{firstFrameAt,timeToFirstAudioMs:firstFrameAt-started,ttsStatus:"first-frame"});
+            noteJob(current);
+            console.log("[BROADCAST] first TTS frame job="+id+" ms="+(firstFrameAt-started)+" samples="+frame.length);
+          }
+          buffers.push(float32ToPcm16(frame));
+          frameCount+=1;
+          if(buffers.length>=BROADCAST_STREAM_BATCH_FRAMES)queueAudioPart();
+        }
+      });
+      queueAudioPart();
+    }else{
+      console.warn("[BROADCAST] tts.stream unavailable; falling back to buffered speak job="+id);
+      const samples=await enqueue(()=>tts.speak(current?.text||job.text,{voice:voice.value,decodeSteps:BROADCAST_TTS_DECODE_STEPS}));
+      firstFrameAt=Date.now();
+      buffers=[float32ToPcm16(samples)];
+      frameCount=1;
+      queueAudioPart();
     }
-    console.log("[BROADCAST] generation complete id="+id+" voice="+voice.name+" ms="+(Date.now()-started)+" chunks="+chunks.length);
+    if(audioParts===0)throw new Error("TTS stream produced no audio");
+    const markerFrames=Math.max(1,Math.round(tts.sampleRate*0.1));
+    const marker=broadcast.enqueueSegment({id:id+"::final",pcm:Buffer.alloc(markerFrames*2),sampleRate:tts.sampleRate,meta:{...baseMeta,streamPart:audioParts+1,finalJobPart:true,finalMarker:true,gapMs:0}});
+    const existing=getBroadcastJob(id)||current;
+    const finalStatus=existing?.status==="playing"?"playing":"queued";
+    current=patchBroadcastJob(id,{status:finalStatus,chunksQueued:audioParts,totalChunks:audioParts,generationFinishedAt:Date.now(),generationMs:Date.now()-started,ttsStatus:"complete"});
+    noteJob(current);
+    console.log("[BROADCAST] generation complete id="+id+" voice="+voice.name+" ms="+(Date.now()-started)+" audioParts="+audioParts+" frames="+frameCount+" queue="+marker.queueLength);
   }catch(e){
     const error=e instanceof Error?e.name+": "+e.message:String(e);
     broadcastJobs.failed+=1;
-    current=patchBroadcastJob(id,{status:"failed",lastError:error,finishedAt:Date.now()});
+    current=patchBroadcastJob(id,{status:"failed",lastError:error,finishedAt:Date.now(),ttsStatus:"failed"});
     noteJob(current);
     console.error("[BROADCAST] job failed id="+id+":",error);
   }finally{
@@ -169,15 +200,16 @@ broadcast.subscribe((event)=>{
     return;
   }
   if(event.type==="finished"){
-    const played=Math.min(Number(existing.totalChunks||1),Number(existing.playedChunks||0)+1);
-    const done=played>=Number(existing.totalChunks||1);
+    const isMarker=event?.segment?.meta?.finalMarker===true;
+    const played=Number(existing.playedChunks||0)+(isMarker?0:1);
+    const done=event?.segment?.meta?.finalJobPart===true;
     const patch={playedChunks:played,status:done?"completed":"playing",lastPlaybackFinishedAt:event.at};
     if(done){patch.playedAt=event.at;patch.finishedAt=event.at;}
     const updated=patchBroadcastJob(parentId,patch);
     if(done){
       broadcastJobs.completed+=1;
       pruneBroadcastJobs();
-      console.log("[BROADCAST] job completed id="+parentId+" chunks="+played);
+      console.log("[BROADCAST] job completed id="+parentId+" audioParts="+played);
     }
     noteJob(updated);
   }
