@@ -1,12 +1,14 @@
 {
   "name": "aharon-tts-server",
-  "version": "0.6.0-radio-mvp",
+  "version": "0.6.1",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
-    "start": "node src/radio-server.js",
-    "check": "node --check src/radio-server.js && node --check src/broadcast.js"
+    "start": "node src/start.js",
+    "check": "node --check src/start.js && node --check src/server.js && node --check src/broadcast.js"
   },
   "dependencies": {
     "express": "^5.1.0",
@@ -17,5 +19,7 @@
     "jssip": "^3.13.8",
     "ws": "^8.21.3"
   },
-  "overrides": { "sharp": "0.35.4" }
+  "overrides": {
+    "sharp": "0.35.4"
+  }
 }
