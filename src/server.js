@@ -7,7 +7,7 @@ import { createBroadcastEngine, float32ToPcm16 } from "./broadcast.js";
 import { createBroadcastJob, getBroadcastJob, patchBroadcastJob, recoverableBroadcastJobs, pruneBroadcastJobs, broadcastJobStoreInfo } from "./broadcast-job-store.js";
 
 for (const k of ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "ORT_NUM_THREADS"]) process.env[k] ||= "1";
-const VERSION = "0.8.2";
+const VERSION = "0.8.3";
 const PORT = Number(process.env.PORT || 3000);
 const API_KEY = process.env.TTS_API_KEY || "";
 const LANGUAGE = process.env.TTS_LANGUAGE || "hebrew";
@@ -268,26 +268,34 @@ app.post("/v1/broadcast/segment",auth,(req,res)=>{
   const text=typeof req.body?.text==="string"?req.body.text.trim():(typeof req.body?.content?.text==="string"?req.body.content.text.trim():"");
   if(!text)return res.status(400).json({ok:false,error:"text is required"});
   const language=String(req.body?.content?.language||req.body?.language||"").toLowerCase();
-  const questionMarks=(text.match(/\\?/g)||[]).length;
-  const looksLikeBrokenHebrew=(language==="he"||language==="hebrew")&&!/[\\u0590-\\u05ff]/.test(text)&&questionMarks>=3;
-  if(text.includes("\\uFFFD")||looksLikeBrokenHebrew)return res.status(400).json({ok:false,error:"invalid_text_encoding",message:"Text appears to be corrupted before reaching the TTS service. Send JSON as UTF-8.",language,questionMarks});
+  const questionMarks=(text.match(/\?/g)||[]).length;
+  const hasHebrew=/[\u0590-\u05ff]/.test(text);
+  const looksLikeBrokenHebrew=(language==="he"||language==="hebrew")&&!hasHebrew&&questionMarks>=3;
+  if(text.includes("\uFFFD")||looksLikeBrokenHebrew)return res.status(400).json({ok:false,error:"invalid_text_encoding",message:"Text appears to be corrupted before reaching the TTS service. Send JSON as UTF-8.",language,questionMarks,hasHebrew});
   if(text.length>MAX_TEXT_LENGTH)return res.status(413).json({ok:false,error:"text is too long; max "+MAX_TEXT_LENGTH});
   const id=typeof req.body?.id==="string"&&req.body.id.trim()?req.body.id.trim():"segment_"+crypto.randomUUID();
   if(id.length>200)return res.status(400).json({ok:false,error:"id is too long"});
   const payload=sanitizeBroadcastPayload(req.body||{},text,id);
-  const created=createBroadcastJob(payload);
-  if(!created.created){
-    const existing=created.job;
-    if(existing.text!==text)return res.status(409).json({ok:false,error:"broadcast_job_id_conflict",id,status:existing.status});
-    if(existing.status==="failed"){
-      const retry=patchBroadcastJob(id,{status:"pending",lastError:null,playedChunks:0,chunksQueued:0,totalChunks:0});
-      scheduleBroadcastJob(retry);
-      return res.status(202).json({ok:true,accepted:true,retried:true,id,status:"pending",job:publicJob(retry),broadcast:broadcast.info()});
+  try{
+    const created=createBroadcastJob(payload);
+    if(!created.created){
+      const existing=created.job;
+      if(existing.text!==text)return res.status(409).json({ok:false,error:"broadcast_job_id_conflict",id,status:existing.status});
+      if(existing.status==="failed"){
+        const retry=patchBroadcastJob(id,{status:"pending",lastError:null,playedChunks:0,chunksQueued:0,totalChunks:0});
+        if(!retry)return res.status(500).json({ok:false,error:"broadcast_job_retry_failed",id});
+        scheduleBroadcastJob(retry);
+        return res.status(202).json({ok:true,accepted:true,retried:true,id,status:"pending",job:publicJob(retry),broadcast:broadcast.info()});
+      }
+      return res.status(existing.status==="completed"?200:202).json({ok:true,accepted:existing.status!=="completed",duplicate:true,id,status:existing.status,job:publicJob(existing),broadcast:broadcast.info()});
     }
-    return res.status(existing.status==="completed"?200:202).json({ok:true,accepted:existing.status!=="completed",duplicate:true,id,status:existing.status,job:publicJob(existing),broadcast:broadcast.info()});
+    scheduleBroadcastJob(created.job);
+    return res.status(202).json({ok:true,accepted:true,id,status:"pending",job:publicJob(created.job),broadcast:broadcast.info()});
+  }catch(e){
+    const message=e instanceof Error?e.name+": "+e.message:String(e);
+    console.error("[BROADCAST] accept failed id="+id+":",message);
+    return res.status(500).json({ok:false,error:"broadcast_accept_failed",id,message});
   }
-  scheduleBroadcastJob(created.job);
-  res.status(202).json({ok:true,accepted:true,id,status:"pending",job:publicJob(created.job),broadcast:broadcast.info()});
 });
 
 app.post("/v1/broadcast/test-tone",auth,(req,res)=>{const info=broadcast.info();const rate=Number(info.sampleRate||24000);const seconds=Math.max(0.5,Math.min(5,Number(req.body?.seconds||2)));const frequency=Math.max(220,Math.min(2000,Number(req.body?.frequency||880)));const frames=Math.round(rate*seconds);const pcm=Buffer.allocUnsafe(frames*2);for(let i=0;i<frames;i++){const fade=Math.min(1,i/(rate*0.02),(frames-i-1)/(rate*0.02));const sample=Math.sin(2*Math.PI*frequency*i/rate)*0.22*Math.max(0,fade);pcm.writeInt16LE(Math.round(sample*32767),i*2);}const id=`tone_${Date.now()}`;const queued=broadcast.enqueueSegment({id,pcm,sampleRate:rate,meta:{type:"test-tone",priority:100,voice:null,speakerId:"diagnostic",eventId:null,textPreview:`${frequency}Hz test tone`}});res.status(202).json({ok:true,accepted:true,id,seconds,frequency,sampleRate:rate,queued,broadcast:broadcast.info()});});
