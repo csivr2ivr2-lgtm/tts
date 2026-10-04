@@ -259,17 +259,6 @@ YOUTUBE_RECONNECT_MS=5000
 
 Do not commit the stream key or the production background asset when it is meant to remain outside deployments.
 
-Manual control:
+Set `YOUTUBE_LIVE_ENABLED=true` to enable automatic startup. The publisher starts only after the TTS engine has initialized the broadcast sample rate, then reconnects automatically after transient RTMPS disconnects.
 
-```bash
-curl "https://tts.aharon.cloud/admin/youtube/status" \
-  -H "Authorization: Bearer YOUR_KEY"
-
-curl -X POST "https://tts.aharon.cloud/admin/youtube/start" \
-  -H "Authorization: Bearer YOUR_KEY"
-
-curl -X POST "https://tts.aharon.cloud/admin/youtube/stop" \
-  -H "Authorization: Bearer YOUR_KEY"
-```
-
-`YOUTUBE_LIVE_ENABLED=true` enables automatic startup after the TTS model initializes. The publisher reconnects automatically after transient RTMPS disconnects. `/health` exposes only safe YouTube state and never returns the stream key.
+`/health` exposes the safe publisher state under `broadcast.youtube`; it never returns the stream key. Set `YOUTUBE_LIVE_ENABLED=false` and restart the Node process to keep the publisher disabled.

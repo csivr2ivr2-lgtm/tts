@@ -1,3 +1,5 @@
+import { createYouTubePublisher } from "./youtube/youtube-publisher.js";
+
 const DEFAULT_CHUNK_MS = Number(process.env.BROADCAST_CHUNK_MS || 100);
 const DEFAULT_GAP_MS = Number(process.env.BROADCAST_GAP_MS || 120);
 const MAX_QUEUE_SEGMENTS = Number(process.env.BROADCAST_MAX_QUEUE_SEGMENTS || 250);
@@ -52,6 +54,43 @@ export function createBroadcastEngine(options = {}) {
   let bytesSent = 0;
   let lastStartedAt = null;
   let lastFinishedAt = null;
+  let api = null;
+  let youtube = null;
+  let youtubeStartRequested = false;
+
+  function youtubeOptions() {
+    return {
+      enabled: process.env.YOUTUBE_LIVE_ENABLED === "true",
+      url: process.env.YOUTUBE_RTMPS_URL || "rtmps://a.rtmps.youtube.com/live2",
+      streamKey: process.env.YOUTUBE_STREAM_KEY || "",
+      backgroundFile: process.env.YOUTUBE_BACKGROUND_FILE || "",
+      width: Math.max(320, Number(process.env.YOUTUBE_WIDTH || 1280)),
+      height: Math.max(240, Number(process.env.YOUTUBE_HEIGHT || 720)),
+      fps: Math.max(1, Math.min(60, Number(process.env.YOUTUBE_FPS || 30))),
+      gopSeconds: Math.max(1, Math.min(4, Number(process.env.YOUTUBE_GOP_SECONDS || 2))),
+      videoBitrateKbps: Math.max(300, Number(process.env.YOUTUBE_VIDEO_BITRATE_KBPS || 2500)),
+      reconnectMs: Math.max(1000, Number(process.env.YOUTUBE_RECONNECT_MS || 5000)),
+    };
+  }
+
+  function ensureYouTube() {
+    if (!youtube) youtube = createYouTubePublisher({ broadcast: api, options: youtubeOptions() });
+    return youtube;
+  }
+
+  function maybeStartYouTube() {
+    if (process.env.YOUTUBE_LIVE_ENABLED !== "true" || youtubeStartRequested) return;
+    youtubeStartRequested = true;
+    queueMicrotask(() => {
+      try {
+        ensureYouTube().start();
+        console.log("[YOUTUBE] direct publisher auto-start requested");
+      } catch (error) {
+        youtubeStartRequested = false;
+        console.error("[YOUTUBE] auto-start failed:", error instanceof Error ? error.message : String(error));
+      }
+    });
+  }
 
   function bytesPerTick() {
     if (!sampleRate) return 0;
@@ -163,6 +202,7 @@ export function createBroadcastEngine(options = {}) {
     if (sampleRate && sampleRate !== rate) throw new Error(`Broadcast sample rate already locked to ${sampleRate}, got ${rate}`);
     sampleRate = rate;
     ensureTimer();
+    maybeStartYouTube();
     return sampleRate;
   }
 
@@ -276,8 +316,26 @@ export function createBroadcastEngine(options = {}) {
       bytesSent,
       lastStartedAt,
       lastFinishedAt,
+      youtube: youtube ? youtube.info() : {
+        enabled: process.env.YOUTUBE_LIVE_ENABLED === "true",
+        configured: Boolean(process.env.YOUTUBE_STREAM_KEY && process.env.YOUTUBE_BACKGROUND_FILE),
+        status: process.env.YOUTUBE_LIVE_ENABLED === "true" ? "waiting-for-tts" : "disabled",
+        connected: false,
+      },
     };
   }
 
-  return { attach, attachRaw, enqueueSegment, info, setSampleRate, subscribe, subscribePcm };
+  api = {
+    attach,
+    attachRaw,
+    enqueueSegment,
+    info,
+    setSampleRate,
+    subscribe,
+    subscribePcm,
+    startYouTube: () => ensureYouTube().start(),
+    stopYouTube: () => youtube ? youtube.stop() : null,
+    youtubeInfo: () => youtube ? youtube.info() : null,
+  };
+  return api;
 }
