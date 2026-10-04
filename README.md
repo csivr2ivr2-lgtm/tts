@@ -228,3 +228,48 @@ curl -X POST "https://tts.aharon.cloud/admin/sip/disconnect" \
 ```
 
 The SIP password is never included in status responses. Until the WebRTC media bridge is enabled, incoming SIP INVITEs are rejected cleanly instead of being answered without media.
+
+## YouTube Live — direct Node.js publisher
+
+v0.9.0 can publish the existing continuous broadcast directly to YouTube Live without spawning an `ffmpeg` process.
+
+Runtime path:
+
+```text
+TTS -> broadcast PCM -> in-process MP3 encoder -> FLV/RTMPS -> YouTube
+                     + static image -> H.264 WASM ----^
+```
+
+The background image is encoded once when the publisher starts. The same two-second H.264 GOP is then looped with increasing timestamps, while broadcast PCM is resampled to 44.1 kHz stereo and encoded to 128 kbps MP3.
+
+Configure only through server environment variables:
+
+```env
+YOUTUBE_LIVE_ENABLED=false
+YOUTUBE_RTMPS_URL=rtmps://a.rtmps.youtube.com/live2
+YOUTUBE_STREAM_KEY=YOUR_YOUTUBE_STREAM_KEY
+YOUTUBE_BACKGROUND_FILE=/home/USER/.cache/aharon-tts/youtube-background.png
+YOUTUBE_WIDTH=1280
+YOUTUBE_HEIGHT=720
+YOUTUBE_FPS=30
+YOUTUBE_VIDEO_BITRATE_KBPS=2500
+YOUTUBE_GOP_SECONDS=2
+YOUTUBE_RECONNECT_MS=5000
+```
+
+Do not commit the stream key or the production background asset when it is meant to remain outside deployments.
+
+Manual control:
+
+```bash
+curl "https://tts.aharon.cloud/admin/youtube/status" \
+  -H "Authorization: Bearer YOUR_KEY"
+
+curl -X POST "https://tts.aharon.cloud/admin/youtube/start" \
+  -H "Authorization: Bearer YOUR_KEY"
+
+curl -X POST "https://tts.aharon.cloud/admin/youtube/stop" \
+  -H "Authorization: Bearer YOUR_KEY"
+```
+
+`YOUTUBE_LIVE_ENABLED=true` enables automatic startup after the TTS model initializes. The publisher reconnects automatically after transient RTMPS disconnects. `/health` exposes only safe YouTube state and never returns the stream key.

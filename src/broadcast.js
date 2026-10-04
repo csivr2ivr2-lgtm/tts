@@ -41,6 +41,7 @@ export function createBroadcastEngine(options = {}) {
   let sampleRate = Number(options.sampleRate || 0) || null;
   const listeners = new Set();
   const rawListeners = new Set();
+  const pcmListeners = new Set();
   const eventListeners = new Set();
   const queue = [];
   let current = null;
@@ -77,6 +78,9 @@ export function createBroadcastEngine(options = {}) {
   function broadcast(buffer) {
     writeTo(listeners, buffer);
     writeTo(rawListeners, buffer);
+    for (const listener of [...pcmListeners]) {
+      try { listener(buffer, sampleRate); } catch {}
+    }
   }
 
   function publicItem(item) {
@@ -233,15 +237,23 @@ export function createBroadcastEngine(options = {}) {
     return () => eventListeners.delete(listener);
   }
 
+  function subscribePcm(listener) {
+    if (typeof listener !== "function") throw new Error("PCM listener must be a function");
+    pcmListeners.add(listener);
+    ensureTimer();
+    return () => pcmListeners.delete(listener);
+  }
+
   function info() {
     return {
       sampleRate,
       format: "pcm_s16le_wav_stream",
       chunkMs,
       gapMs,
-      listeners: listeners.size + rawListeners.size,
+      listeners: listeners.size + rawListeners.size + pcmListeners.size,
       wavListeners: listeners.size,
       rawListeners: rawListeners.size,
+      internalPcmListeners: pcmListeners.size,
       queuedSegments: queue.length,
       current: current ? {
         id: current.id,
@@ -267,5 +279,5 @@ export function createBroadcastEngine(options = {}) {
     };
   }
 
-  return { attach, attachRaw, enqueueSegment, info, setSampleRate, subscribe };
+  return { attach, attachRaw, enqueueSegment, info, setSampleRate, subscribe, subscribePcm };
 }
