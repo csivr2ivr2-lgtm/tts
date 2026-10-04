@@ -1,6 +1,6 @@
 {
   "name": "aharon-tts-server",
-  "version": "0.8.4",
+  "version": "0.9.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -8,15 +8,19 @@
   },
   "scripts": {
     "start": "node src/start.js",
-    "check": "node --check src/start.js && node --check src/server.js && node --check src/broadcast.js && node --check src/broadcast-job-store.js"
+    "check": "node --check src/start.js && node --check src/server.js && node --check src/broadcast.js && node --check src/broadcast-job-store.js && node --check src/youtube/rtmp-client.js && node --check src/youtube/mp4-h264.js && node --check src/youtube/youtube-publisher.js"
   },
   "dependencies": {
-    "express": "^5.1.0",
-    "pocket-tts-onnx": "^0.1.0",
-    "onnxruntime-node": "^1.29.0",
-    "ogg-opus-decoder": "^1.7.5",
+    "@breezystack/lamejs": "^1.2.7",
     "@huggingface/transformers": "^3.8.1",
+    "express": "^5.1.0",
+    "h264-mp4-encoder": "^1.0.12",
+    "jpeg-js": "^0.4.4",
     "jssip": "^3.13.8",
+    "ogg-opus-decoder": "^1.7.5",
+    "onnxruntime-node": "^1.29.0",
+    "pngjs": "^7.0.0",
+    "pocket-tts-onnx": "^0.1.0",
     "ws": "^8.21.3"
   },
   "overrides": {
