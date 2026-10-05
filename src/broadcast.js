@@ -1,8 +1,10 @@
+import { fileURLToPath } from "node:url";
 import { createYouTubePublisher } from "./youtube/youtube-publisher.js";
 
 const DEFAULT_CHUNK_MS = Number(process.env.BROADCAST_CHUNK_MS || 100);
 const DEFAULT_GAP_MS = Number(process.env.BROADCAST_GAP_MS || 120);
 const MAX_QUEUE_SEGMENTS = Number(process.env.BROADCAST_MAX_QUEUE_SEGMENTS || 250);
+const DEFAULT_YOUTUBE_BACKGROUND = fileURLToPath(new URL("../assets/youtube/aharon-ai-radio-background.parts.json", import.meta.url));
 
 function clampPcm16(sample) {
   const x = Math.max(-1, Math.min(1, Number(sample) || 0));
@@ -63,9 +65,9 @@ export function createBroadcastEngine(options = {}) {
       enabled: process.env.YOUTUBE_LIVE_ENABLED === "true",
       url: process.env.YOUTUBE_RTMPS_URL || "rtmps://a.rtmps.youtube.com/live2",
       streamKey: process.env.YOUTUBE_STREAM_KEY || "",
-      backgroundFile: process.env.YOUTUBE_BACKGROUND_FILE || "",
-      width: Math.max(320, Math.floor(Number(process.env.YOUTUBE_WIDTH || 1280) / 2) * 2),
-      height: Math.max(240, Math.floor(Number(process.env.YOUTUBE_HEIGHT || 720) / 2) * 2),
+      backgroundFile: process.env.YOUTUBE_BACKGROUND_FILE || DEFAULT_YOUTUBE_BACKGROUND,
+      width: Math.max(320, Number(process.env.YOUTUBE_WIDTH || 1280)),
+      height: Math.max(240, Number(process.env.YOUTUBE_HEIGHT || 720)),
       fps: Math.max(1, Math.min(60, Number(process.env.YOUTUBE_FPS || 30))),
       gopSeconds: Math.max(1, Math.min(4, Number(process.env.YOUTUBE_GOP_SECONDS || 2))),
       videoBitrateKbps: Math.max(300, Number(process.env.YOUTUBE_VIDEO_BITRATE_KBPS || 2500)),
@@ -318,7 +320,7 @@ export function createBroadcastEngine(options = {}) {
       lastFinishedAt,
       youtube: youtube ? youtube.info() : {
         enabled: process.env.YOUTUBE_LIVE_ENABLED === "true",
-        configured: Boolean(process.env.YOUTUBE_STREAM_KEY && process.env.YOUTUBE_BACKGROUND_FILE),
+        configured: Boolean(process.env.YOUTUBE_STREAM_KEY),
         status: process.env.YOUTUBE_LIVE_ENABLED === "true" ? "waiting-for-tts" : "disabled",
         connected: false,
       },
