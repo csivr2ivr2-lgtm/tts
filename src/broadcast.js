@@ -42,6 +42,10 @@ export function createBroadcastEngine(options = {}) {
   const chunkMs = Math.max(20, Number(options.chunkMs || DEFAULT_CHUNK_MS));
   const gapMs = Math.max(0, Number(options.gapMs ?? DEFAULT_GAP_MS));
   const maxQueueSegments = Math.max(1, Number(options.maxQueueSegments || MAX_QUEUE_SEGMENTS));
+  const now = options.now || Date.now;
+  const maxQueueBytes = Number(options.maxQueueBytes || 64 * 1024 * 1024);
+  let beforeStart = () => true;
+  let fillerProvider = null;
   let sampleRate = Number(options.sampleRate || 0) || null;
   const listeners = new Set();
   const rawListeners = new Set();
@@ -144,19 +148,31 @@ export function createBroadcastEngine(options = {}) {
     }
   }
 
+  function queuedBytes() { return queue.reduce((sum,item)=>sum+item.pcm.length,0)+(current?.pcm.length||0); }
+  function canEnqueue(bytes) { return queue.length < maxQueueSegments && queuedBytes()+bytes <= maxQueueBytes; }
   function startNext() {
-    current = queue.shift() || null;
-    currentOffset = 0;
-    if (current) {
-      current.startedAt = Date.now();
-      lastStartedAt = current.startedAt;
-      emit({ type: "started", segment: publicItem(current), at: current.startedAt });
+    currentOffset=0;
+    for(let i=0;i<queue.length;){
+      const item=queue[i];
+      if(item.meta.validUntil && item.meta.validUntil<=now()) {
+        queue.splice(i,1);emit({type:'expired',segment:publicItem(item),at:now()});continue;
+      }
+      if(item.meta.notBefore && item.meta.notBefore>now()){i++;continue;}
+      queue.splice(i,1);
+      try { if(!beforeStart(publicItem(item)))continue; }
+      catch { emit({type:'start-blocked',segment:publicItem(item),at:now()});queue.splice(i,0,item);return; }
+      current=item;break;
     }
+    if(!current && fillerProvider){
+      const filler=fillerProvider(now());
+      if(filler?.pcm?.length && filler.sampleRate===sampleRate)current={...filler,priority:filler.meta?.priority??1,queuedAt:now(),durationSec:filler.pcm.length/(sampleRate*2),gapAppended:true};
+    }
+    if(current){current.startedAt=now();lastStartedAt=current.startedAt;emit({type:'started',segment:publicItem(current),at:current.startedAt});}
   }
 
   function finishCurrent() {
     if (!current) return;
-    current.finishedAt = Date.now();
+    current.finishedAt = now();
     lastFinishedAt = current.finishedAt;
     playedSegments += 1;
     emit({ type: "finished", segment: publicItem(current), at: current.finishedAt });
@@ -193,7 +209,7 @@ export function createBroadcastEngine(options = {}) {
   }
 
   function ensureTimer() {
-    if (timer) return;
+    if (timer || options.manual === true) return;
     timer = setInterval(tick, chunkMs);
     timer.unref?.();
   }
@@ -209,26 +225,26 @@ export function createBroadcastEngine(options = {}) {
   }
 
   function enqueueSegment({ id, pcm, sampleRate: segmentRate, meta = {} }) {
-    if (!Buffer.isBuffer(pcm) || pcm.length === 0) throw new Error("Broadcast segment PCM is empty");
+    if (!Buffer.isBuffer(pcm) || pcm.length === 0 || pcm.length % 2) throw new Error("Broadcast segment PCM is empty");
     setSampleRate(segmentRate);
-    if (queue.length >= maxQueueSegments) {
-      queue.shift();
-      droppedSegments += 1;
-    }
+    if (id && (current?.id === id || queue.some(item=>item.id===id))) throw new Error("duplicate_segment");
+    if (!canEnqueue(pcm.length)) throw new Error("broadcast_queue_full");
     const item = {
-      id: id || `seg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-      pcm,
+      id: id || `seg_${now()}_${Math.random().toString(36).slice(2, 8)}`,
+      pcm: Buffer.from(pcm),
       sampleRate,
       durationSec: pcm.length / (sampleRate * 2),
       meta,
-      queuedAt: Date.now(),
+      queuedAt: now(),
       startedAt: null,
       finishedAt: null,
-      gapAppended: false,
+      gapAppended: true,
     };
-    const priority = Number.isFinite(Number(meta?.priority)) ? Number(meta.priority) : 50;
+    const segmentGapMs = Number.isFinite(Number(meta.gapMs)) ? Math.max(0,Number(meta.gapMs)) : gapMs;
+    if(segmentGapMs>0)item.pcm=Buffer.concat([item.pcm,Buffer.alloc(Math.round(sampleRate*segmentGapMs/1000)*2)]);
+    const priority = meta?.priority !== null && meta?.priority !== undefined && Number.isFinite(Number(meta.priority)) ? Number(meta.priority) : 50;
     item.priority = priority;
-    const index = queue.findIndex((queued) => Number(queued.priority || 50) < priority);
+    const index = queue.findIndex((queued) => Number(queued.priority ?? 50) < priority);
     if (index === -1) queue.push(item); else queue.splice(index, 0, item);
     return { ...item, pcm: undefined };
   }
@@ -297,6 +313,9 @@ export function createBroadcastEngine(options = {}) {
       rawListeners: rawListeners.size,
       internalPcmListeners: pcmListeners.size,
       queuedSegments: queue.length,
+      readyAudioSec: queue.filter(x=>!x.meta.notBefore||x.meta.notBefore<=now()).reduce((sum,x)=>sum+x.durationSec,0),
+      coverageUntil: now()+queue.filter(x=>!x.meta.notBefore||x.meta.notBefore<=now()).reduce((sum,x)=>sum+x.durationSec*1000,0),
+      mode: current ? (current.meta?.music ? current.meta.mode : 'VOICE_PLAYING') : (queue.length ? 'VOICE_READY' : 'WAITING_FOR_READY_PROGRAM'),
       current: current ? {
         id: current.id,
         durationSec: Number(current.durationSec.toFixed(3)),
@@ -331,6 +350,12 @@ export function createBroadcastEngine(options = {}) {
     attach,
     attachRaw,
     enqueueSegment,
+    canEnqueue,
+    hasSegment: id => current?.id === id || queue.some(item=>item.id===id),
+    setBeforeStart: fn => { beforeStart=fn; },
+    setFillerProvider: fn => { fillerProvider=fn; },
+    tick,
+    close: () => { if(timer)clearInterval(timer); timer=null; youtube?.stop(); },
     info,
     setSampleRate,
     subscribe,
@@ -341,3 +366,4 @@ export function createBroadcastEngine(options = {}) {
   };
   return api;
 }
+
