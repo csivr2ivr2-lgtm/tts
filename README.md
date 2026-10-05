@@ -248,7 +248,7 @@ Configure only through server environment variables:
 YOUTUBE_LIVE_ENABLED=false
 YOUTUBE_RTMPS_URL=rtmps://a.rtmps.youtube.com/live2
 YOUTUBE_STREAM_KEY=YOUR_YOUTUBE_STREAM_KEY
-YOUTUBE_BACKGROUND_FILE=/home/USER/.cache/aharon-tts/youtube-background.png
+YOUTUBE_BACKGROUND_FILE=
 YOUTUBE_WIDTH=1280
 YOUTUBE_HEIGHT=720
 YOUTUBE_FPS=30
@@ -257,7 +257,7 @@ YOUTUBE_GOP_SECONDS=2
 YOUTUBE_RECONNECT_MS=5000
 ```
 
-Do not commit the stream key or the production background asset when it is meant to remain outside deployments.
+The branded `Aharon AI Radio` 16:9 background is bundled under `assets/youtube/` through `aharon-ai-radio-background.parts.json` and its Base64 chunks. It is used automatically. `YOUTUBE_BACKGROUND_FILE` is optional and can override it with another PNG/JPEG path. Never commit the stream key.
 
 Set `YOUTUBE_LIVE_ENABLED=true` to enable automatic startup. The publisher starts only after the TTS engine has initialized the broadcast sample rate, then reconnects automatically after transient RTMPS disconnects.
 
