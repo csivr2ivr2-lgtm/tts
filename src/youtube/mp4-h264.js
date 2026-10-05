@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
+import { dirname, resolve } from "node:path";
 
 const require=createRequire(import.meta.url);
 
@@ -62,8 +63,28 @@ function resizeCoverRgba(source,sourceWidth,sourceHeight,width,height){
   return out;
 }
 
+async function readBackgroundBytes(file){
+  const location=String(file||"");
+  if(location.endsWith(".parts.json")){
+    const manifest=JSON.parse(await readFile(location,"utf8"));
+    if(manifest?.encoding!=="base64"||!Array.isArray(manifest.parts)||manifest.parts.length===0)throw new Error("Invalid YouTube background parts manifest");
+    let encoded="";
+    for(const rawName of manifest.parts){
+      const name=String(rawName||"").trim();
+      if(!name||name.includes("..")||name.includes("/")||name.includes("\\"))throw new Error("Invalid YouTube background part name");
+      encoded+=await readFile(resolve(dirname(location),name),"utf8");
+    }
+    const bytes=Buffer.from(encoded.replace(/\s+/g,""),"base64");
+    if(!bytes.length)throw new Error("Bundled YouTube background decoded to an empty file");
+    return bytes;
+  }
+  const stored=await readFile(location);
+  return location.endsWith(".b64")?Buffer.from(stored.toString("ascii").replace(/\s+/g,""),"base64"):stored;
+}
+
 async function readBackgroundRgba(file,width,height){
-  const bytes=await readFile(file);let decoded;
+  const bytes=await readBackgroundBytes(file);
+  let decoded;
   if(bytes.length>=8&&bytes.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10]))){const {PNG}=require("pngjs");decoded=PNG.sync.read(bytes);}
   else if(bytes.length>=2&&bytes[0]===0xff&&bytes[1]===0xd8){const jpeg=require("jpeg-js");decoded=jpeg.decode(bytes,{useTArray:true,formatAsRGBA:true});}
   else throw new Error("Unsupported YouTube background image; use PNG or JPEG");
