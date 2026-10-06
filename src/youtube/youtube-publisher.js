@@ -1,8 +1,7 @@
-import { createRequire } from "node:module";
+import * as lame from "@breezystack/lamejs";
 import { RtmpPublisher } from "./rtmp-client.js";
 import { encodeStaticBackground } from "./mp4-h264.js";
 
-const require=createRequire(import.meta.url);
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 
 class StreamingResampler{
@@ -35,11 +34,11 @@ export function createYouTubePublisher({broadcast,options={}}={}){
   let desired=false,runner=null,client=null,video=null,videoTimer=null,unsubscribePcm=null,resampler=null,audioSourceRate=null,pendingAudio=new Int16Array(0),mp3Encoder=null,mp3Splitter=null,audioSamplesSent=0,videoTimestamp=0,videoIndex=0,mediaEpoch=0;
   const state={status:"idle",connected:false,startedAt:null,lastConnectedAt:null,lastDisconnectedAt:null,lastError:null,reconnects:0,videoPrepared:false,videoSamples:0,connectionPhase:"idle",lastRtmpStatusCode:null,lastRtmpWarning:null};
 
-  function info(){return{publisherRevision:"rtmp-control-v2",enabled:desired,autoStartEnabled:config.enabled,configured:Boolean(config.streamKey&&config.backgroundFile),status:state.status,connected:state.connected,desired,startedAt:state.startedAt,lastConnectedAt:state.lastConnectedAt,lastDisconnectedAt:state.lastDisconnectedAt,lastError:state.lastError,reconnects:state.reconnects,backgroundConfigured:Boolean(config.backgroundFile),streamKeyConfigured:Boolean(config.streamKey),resolution:`${config.width}x${config.height}`,fps:config.fps,videoBitrateKbps:config.videoBitrateKbps,audioCodec:"mp3",audioSampleRate:44100,audioBitrateKbps:config.audioBitrateKbps,connectTimeoutMs:config.connectTimeoutMs,connectionPhase:state.connectionPhase,lastRtmpStatusCode:state.lastRtmpStatusCode,lastRtmpWarning:state.lastRtmpWarning,videoPrepared:state.videoPrepared,videoSamples:state.videoSamples};}
+  function info(){return{publisherRevision:"rtmp-mp3-esm-v3",enabled:desired,autoStartEnabled:config.enabled,configured:Boolean(config.streamKey&&config.backgroundFile),status:state.status,connected:state.connected,desired,startedAt:state.startedAt,lastConnectedAt:state.lastConnectedAt,lastDisconnectedAt:state.lastDisconnectedAt,lastError:state.lastError,reconnects:state.reconnects,backgroundConfigured:Boolean(config.backgroundFile),streamKeyConfigured:Boolean(config.streamKey),resolution:`${config.width}x${config.height}`,fps:config.fps,videoBitrateKbps:config.videoBitrateKbps,audioCodec:"mp3",audioSampleRate:44100,audioBitrateKbps:config.audioBitrateKbps,connectTimeoutMs:config.connectTimeoutMs,connectionPhase:state.connectionPhase,lastRtmpStatusCode:state.lastRtmpStatusCode,lastRtmpWarning:state.lastRtmpWarning,videoPrepared:state.videoPrepared,videoSamples:state.videoSamples};}
 
   async function prepareVideo(){if(video)return video;state.status="preparing";video=await encodeStaticBackground({file:config.backgroundFile,width:config.width,height:config.height,fps:config.fps,gopSeconds:config.gopSeconds,bitrateKbps:config.videoBitrateKbps});state.videoPrepared=true;state.videoSamples=video.samples.length;return video;}
 
-  function resetAudio(){const lame=require("@breezystack/lamejs");const Mp3Encoder=lame.Mp3Encoder||lame.default?.Mp3Encoder;if(!Mp3Encoder)throw new Error("MP3 encoder unavailable");mp3Encoder=new Mp3Encoder(2,44100,config.audioBitrateKbps);mp3Splitter=new Mp3FrameSplitter();pendingAudio=new Int16Array(0);resampler=null;audioSourceRate=null;audioSamplesSent=0;}
+  function resetAudio(){const Mp3Encoder=lame.Mp3Encoder||lame.default?.Mp3Encoder;if(typeof Mp3Encoder!=="function")throw new Error("MP3 encoder unavailable from ESM module");mp3Encoder=new Mp3Encoder(2,44100,config.audioBitrateKbps);mp3Splitter=new Mp3FrameSplitter();pendingAudio=new Int16Array(0);resampler=null;audioSourceRate=null;audioSamplesSent=0;}
   function onPcm(buffer,sourceRate){
     if(!client?.publishing||!Buffer.isBuffer(buffer)||!buffer.length)return;
     if(!resampler||audioSourceRate!==sourceRate){audioSourceRate=sourceRate;resampler=new StreamingResampler(sourceRate,44100);pendingAudio=new Int16Array(0);}
