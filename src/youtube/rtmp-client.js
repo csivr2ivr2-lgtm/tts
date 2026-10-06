@@ -41,6 +41,8 @@ function amf0DecodeOne(buffer,offset=0){
   if(type===1){if(offset>=buffer.length)throw new Error("AMF0 bool truncated");return{value:buffer[offset]!==0,offset:offset+1};}
   if(type===2||type===12){const n=type===2?2:4;if(offset+n>buffer.length)throw new Error("AMF0 string truncated");const len=type===2?buffer.readUInt16BE(offset):buffer.readUInt32BE(offset);offset+=n;if(offset+len>buffer.length)throw new Error("AMF0 string data truncated");return{value:buffer.toString("utf8",offset,offset+len),offset:offset+len};}
   if(type===5||type===6)return{value:null,offset};
+  if(type===7){if(offset+2>buffer.length)throw new Error("AMF0 reference truncated");return{value:null,offset:offset+2};}
+  if(type===11){if(offset+10>buffer.length)throw new Error("AMF0 date truncated");const value=buffer.readDoubleBE(offset);return{value,offset:offset+10};}
   if(type===3||type===8){if(type===8){if(offset+4>buffer.length)throw new Error("AMF0 ECMA array truncated");offset+=4;}const obj={};while(offset+3<=buffer.length){const len=buffer.readUInt16BE(offset);offset+=2;if(len===0&&buffer[offset]===9){offset++;break;}if(offset+len>buffer.length)throw new Error("AMF0 object key truncated");const key=buffer.toString("utf8",offset,offset+len);offset+=len;const decoded=amf0DecodeOne(buffer,offset);obj[key]=decoded.value;offset=decoded.offset;}return{value:obj,offset};}
   if(type===10){if(offset+4>buffer.length)throw new Error("AMF0 array truncated");const count=buffer.readUInt32BE(offset);offset+=4;const arr=[];for(let i=0;i<count;i++){const d=amf0DecodeOne(buffer,offset);arr.push(d.value);offset=d.offset;}return{value:arr,offset};}
   throw new Error("Unsupported AMF0 type "+type);
@@ -49,7 +51,7 @@ function amf0DecodeOne(buffer,offset=0){
 export function amf0DecodeAll(buffer){const values=[];let offset=0;while(offset<buffer.length){const d=amf0DecodeOne(buffer,offset);values.push(d.value);if(d.offset<=offset)break;offset=d.offset;}return values;}
 
 export class RtmpPublisher extends EventEmitter{
-  constructor({url,streamKey,chunkSize=4096,connectTimeoutMs=15000}={}){
+  constructor({url,streamKey,chunkSize=4096,connectTimeoutMs=30000}={}){
     super();
     if(!url)throw new Error("RTMP URL is required");
     if(!streamKey)throw new Error("RTMP stream key is required");
@@ -69,6 +71,10 @@ export class RtmpPublisher extends EventEmitter{
     this.bytesReceived=0;
     this.lastAck=0;
     this.windowAckSize=2500000;
+    this.sentWindowAckSize=0;
+    this.peerBandwidth=0;
+    this.peerBandwidthLimitType=null;
+    this.phase="idle";
     this._connectResolve=null;this._connectReject=null;this._connectTimer=null;
   }
 
@@ -77,17 +83,19 @@ export class RtmpPublisher extends EventEmitter{
   get port(){return Number(this.url.port||443);}
   get tcUrl(){return `rtmps://${this.host}:${this.port}/${this.app}`;}
 
+  _setPhase(phase){if(this.phase===phase)return;this.phase=phase;this.emit("phase",{phase,at:Date.now()});}
+
   async connect(){
     if(this.publishing)return this;
     if(this.socket)throw new Error("RTMP connection already in progress");
-    this.buffer=Buffer.alloc(0);this.chunkState.clear();this.inChunkSize=128;this.bytesReceived=0;this.lastAck=0;this.streamId=0;this.handshakeState="waiting-s0s1s2";
+    this.buffer=Buffer.alloc(0);this.chunkState.clear();this.inChunkSize=128;this.bytesReceived=0;this.lastAck=0;this.streamId=0;this.sentWindowAckSize=0;this.peerBandwidth=0;this.peerBandwidthLimitType=null;this.handshakeState="waiting-s0s1s2";this._setPhase("tls-connecting");
     return new Promise((resolve,reject)=>{
       this._connectResolve=resolve;this._connectReject=reject;
-      this._connectTimer=setTimeout(()=>this._fail(new Error("RTMP connect timeout")),this.connectTimeoutMs);
+      this._connectTimer=setTimeout(()=>this._fail(new Error(`RTMP connect timeout during ${this.phase}`)),this.connectTimeoutMs);
       const socket=tls.connect({host:this.host,port:this.port,servername:this.host,rejectUnauthorized:true});
       this.socket=socket;
       socket.setNoDelay(true);socket.setKeepAlive(true,30000);
-      socket.on("secureConnect",()=>this._sendC0C1());
+      socket.on("secureConnect",()=>{this._setPhase("rtmp-handshake");this._sendC0C1();});
       socket.on("data",chunk=>this._onData(chunk));
       socket.on("error",error=>this._fail(error));
       socket.on("close",()=>this._onClose());
@@ -105,7 +113,7 @@ export class RtmpPublisher extends EventEmitter{
     if(this.handshakeState!=="done"){
       if(this.handshakeState==="waiting-s0s1s2"&&this.buffer.length>=3073){
         const version=this.buffer[0];if(version!==3)return this._fail(new Error("Unsupported RTMP version "+version));
-        const s1=this.buffer.subarray(1,1537);this.buffer=this.buffer.subarray(3073);this.socket?.write(s1);this.handshakeState="done";this.connected=true;this._sendConnect();
+        const s1=this.buffer.subarray(1,1537);this.buffer=this.buffer.subarray(3073);this.socket?.write(s1);this.handshakeState="done";this.connected=true;this._setPhase("connect-command");this._sendConnect();
       }else return;
     }
     this._parseChunks();
@@ -137,18 +145,28 @@ export class RtmpPublisher extends EventEmitter{
   _handleMessage(msg){
     if(msg.typeId===1&&msg.payload.length>=4){this.inChunkSize=msg.payload.readUInt32BE(0)&0x7fffffff;return;}
     if(msg.typeId===5&&msg.payload.length>=4){this.windowAckSize=msg.payload.readUInt32BE(0);return;}
+    if(msg.typeId===6&&msg.payload.length>=5){
+      const size=msg.payload.readUInt32BE(0),limitType=msg.payload[4];
+      this.peerBandwidth=size;this.peerBandwidthLimitType=limitType;
+      if(size>0&&this.sentWindowAckSize!==size){this._sendMessage({csid:2,typeId:5,streamId:0,timestamp:0,payload:u32be(size)});this.sentWindowAckSize=size;}
+      this.emit("bandwidth",{size,limitType});return;
+    }
     if(msg.typeId===4&&msg.payload.length>=6){const event=msg.payload.readUInt16BE(0);if(event===6){const response=Buffer.allocUnsafe(6);response.writeUInt16BE(7,0);msg.payload.copy(response,2,2,6);this._sendMessage({csid:2,typeId:4,streamId:0,timestamp:0,payload:response});}return;}
     if(msg.typeId!==20&&msg.typeId!==17)return;
     let payload=msg.payload;if(msg.typeId===17&&payload[0]===0)payload=payload.subarray(1);
     let values;try{values=amf0DecodeAll(payload);}catch{return;}
     const command=values[0],transaction=Number(values[1]||0);
-    if(command==="_error"){const info=values.find(v=>v&&typeof v==="object"&&(v.code||v.description));return this._fail(new Error("RTMP command error: "+String(info?.code||info?.description||"unknown")));}
-    if(command==="_result"&&transaction===1){this._afterConnectResult();return;}
-    if(command==="_result"&&transaction===4){const id=Number(values[3]||0);if(!id)return this._fail(new Error("RTMP createStream returned no stream id"));this.streamId=id;this._sendPublish();return;}
+    if(command==="_error"){
+      const info=values.find(v=>v&&typeof v==="object"&&(v.code||v.description));
+      if(transaction===2||transaction===3){this.emit("warning",{transaction,code:String(info?.code||""),description:String(info?.description||"")});return;}
+      return this._fail(new Error("RTMP command error: "+String(info?.code||info?.description||"unknown")));
+    }
+    if(command==="_result"&&transaction===1){this._setPhase("stream-creating");this._afterConnectResult();return;}
+    if(command==="_result"&&transaction===4){const id=Number(values[3]||0);if(!id)return this._fail(new Error("RTMP createStream returned no stream id"));this.streamId=id;this._setPhase("publish-command");this._sendPublish();return;}
     if(command==="onStatus"){
       const info=values.find(v=>v&&typeof v==="object"&&typeof v.code==="string");const code=info?.code||"";this.emit("status",info||{});
       if(code==="NetStream.Publish.Start"){
-        this.publishing=true;clearTimeout(this._connectTimer);this._connectTimer=null;const r=this._connectResolve;this._connectResolve=null;this._connectReject=null;r?.(this);this.emit("publish");
+        this.publishing=true;this._setPhase("live");clearTimeout(this._connectTimer);this._connectTimer=null;const r=this._connectResolve;this._connectResolve=null;this._connectReject=null;r?.(this);this.emit("publish");
       }else if(code.includes("Failed")||code.includes("BadName")||code.includes("Denied"))this._fail(new Error("RTMP publish rejected: "+code));
     }
   }
@@ -158,7 +176,13 @@ export class RtmpPublisher extends EventEmitter{
     this._sendMessage({csid:2,typeId:1,streamId:0,timestamp:0,payload:u32be(this.outChunkSize)});
     this._sendCommand(3,0,"connect",1,{app:this.app,type:"nonprivate",tcUrl:this.tcUrl,flashVer:"FMLE/3.0 (compatible; AharonTTS/0.9)",fpad:false,capabilities:15,audioCodecs:3575,videoCodecs:252,videoFunction:1,objectEncoding:0});
   }
-  _afterConnectResult(){this._sendCommand(3,0,"releaseStream",2,null,this.streamKey);this._sendCommand(3,0,"FCPublish",3,null,this.streamKey);this._sendCommand(3,0,"createStream",4,null);}
+  _afterConnectResult(){
+    const window=Math.max(1,this.peerBandwidth||this.windowAckSize||2500000);
+    if(this.sentWindowAckSize!==window){this._sendMessage({csid:2,typeId:5,streamId:0,timestamp:0,payload:u32be(window)});this.sentWindowAckSize=window;}
+    this._sendCommand(3,0,"releaseStream",2,null,this.streamKey);
+    this._sendCommand(3,0,"FCPublish",3,null,this.streamKey);
+    this._sendCommand(3,0,"createStream",4,null);
+  }
   _sendPublish(){this._sendCommand(8,this.streamId,"publish",0,null,this.streamKey,"live");}
 
   _sendMessage({csid=3,typeId,streamId=0,timestamp=0,payload}){
@@ -174,7 +198,7 @@ export class RtmpPublisher extends EventEmitter{
   sendVideo(payload,timestamp){if(!this.publishing)return false;this._sendMessage({csid:6,typeId:9,streamId:this.streamId,timestamp,payload});return true;}
   sendMetadata(metadata){if(!this.publishing)return false;const payload=Buffer.concat([amf0Encode("@setDataFrame"),amf0Encode("onMetaData"),amf0Encode(metadata)]);this._sendMessage({csid:5,typeId:18,streamId:this.streamId,timestamp:0,payload});return true;}
 
-  close(){const socket=this.socket;this.socket=null;this.connected=false;this.publishing=false;clearTimeout(this._connectTimer);this._connectTimer=null;if(socket&&!socket.destroyed)socket.destroy();}
-  _fail(error){if(!error)error=new Error("RTMP failure");const reject=this._connectReject;this._connectResolve=null;this._connectReject=null;clearTimeout(this._connectTimer);this._connectTimer=null;if(reject)reject(error);this.emit("error",error);this.close();}
-  _onClose(){const wasPublishing=this.publishing;this.socket=null;this.connected=false;this.publishing=false;clearTimeout(this._connectTimer);this._connectTimer=null;if(this._connectReject){const reject=this._connectReject;this._connectResolve=null;this._connectReject=null;reject(new Error("RTMP socket closed before publish started"));}this.emit("close",{wasPublishing});}
+  close(){const socket=this.socket;this.socket=null;this.connected=false;this.publishing=false;clearTimeout(this._connectTimer);this._connectTimer=null;this._setPhase("closed");if(socket&&!socket.destroyed)socket.destroy();}
+  _fail(error){if(!error)error=new Error("RTMP failure");if(error&&typeof error==="object"&&!error.rtmpPhase)error.rtmpPhase=this.phase;this._setPhase("failed");const reject=this._connectReject;this._connectResolve=null;this._connectReject=null;clearTimeout(this._connectTimer);this._connectTimer=null;if(reject)reject(error);this.emit("error",error);this.close();}
+  _onClose(){const wasPublishing=this.publishing;this.socket=null;this.connected=false;this.publishing=false;clearTimeout(this._connectTimer);this._connectTimer=null;if(this._connectReject){const reject=this._connectReject;this._connectResolve=null;this._connectReject=null;reject(new Error(`RTMP socket closed before publish started during ${this.phase}`));}this.emit("close",{wasPublishing});}
 }
