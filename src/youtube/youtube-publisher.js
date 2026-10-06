@@ -25,17 +25,17 @@ class Mp3FrameSplitter{
 
 function appendInt16(a,b){if(!a?.length)return b;if(!b?.length)return a;const out=new Int16Array(a.length+b.length);out.set(a);out.set(b,a.length);return out;}
 function signed24(n){let v=Math.round(n);if(v<0)v=0x1000000+v;return Buffer.from([(v>>>16)&255,(v>>>8)&255,v&255]);}
-function safeError(error,streamKey){let text=error instanceof Error?`${error.name}: ${error.message}`:String(error);if(streamKey)text=text.split(streamKey).join("[redacted]");return text.slice(0,500);}
+function safeError(error,streamKey){let text=error instanceof Error?`${error.name}: ${error.message}`:String(error);if(error?.rtmpPhase&&!text.includes("phase="))text+=` [phase=${error.rtmpPhase}]`;if(streamKey)text=text.split(streamKey).join("[redacted]");return text.slice(0,500);}
 
 export function createYouTubePublisher({broadcast,options={}}={}){
   if(!broadcast?.subscribePcm)throw new Error("Broadcast engine does not support subscribePcm");
   const config={
-    enabled:options.enabled===true,url:options.url||"rtmps://a.rtmps.youtube.com/live2",streamKey:String(options.streamKey||"").trim(),backgroundFile:String(options.backgroundFile||"").trim(),width:Math.max(320,Number(options.width||1280)),height:Math.max(240,Number(options.height||720)),fps:Math.max(1,Math.min(60,Number(options.fps||30))),gopSeconds:Math.max(1,Math.min(4,Number(options.gopSeconds||2))),videoBitrateKbps:Math.max(300,Number(options.videoBitrateKbps||2500)),audioBitrateKbps:128,reconnectMs:Math.max(1000,Number(options.reconnectMs||5000)),
+    enabled:options.enabled===true,url:options.url||"rtmps://a.rtmps.youtube.com/live2",streamKey:String(options.streamKey||"").trim(),backgroundFile:String(options.backgroundFile||"").trim(),width:Math.max(320,Number(options.width||1280)),height:Math.max(240,Number(options.height||720)),fps:Math.max(1,Math.min(60,Number(options.fps||30))),gopSeconds:Math.max(1,Math.min(4,Number(options.gopSeconds||2))),videoBitrateKbps:Math.max(300,Number(options.videoBitrateKbps||2500)),audioBitrateKbps:128,reconnectMs:Math.max(1000,Number(options.reconnectMs||5000)),connectTimeoutMs:Math.max(5000,Number(options.connectTimeoutMs||process.env.YOUTUBE_CONNECT_TIMEOUT_MS||30000)),
   };
   let desired=false,runner=null,client=null,video=null,videoTimer=null,unsubscribePcm=null,resampler=null,audioSourceRate=null,pendingAudio=new Int16Array(0),mp3Encoder=null,mp3Splitter=null,audioSamplesSent=0,videoTimestamp=0,videoIndex=0,mediaEpoch=0;
-  const state={status:"idle",connected:false,startedAt:null,lastConnectedAt:null,lastDisconnectedAt:null,lastError:null,reconnects:0,videoPrepared:false,videoSamples:0};
+  const state={status:"idle",connected:false,startedAt:null,lastConnectedAt:null,lastDisconnectedAt:null,lastError:null,reconnects:0,videoPrepared:false,videoSamples:0,connectionPhase:"idle",lastRtmpStatusCode:null,lastRtmpWarning:null};
 
-  function info(){return{enabled:desired,autoStartEnabled:config.enabled,configured:Boolean(config.streamKey&&config.backgroundFile),status:state.status,connected:state.connected,desired,startedAt:state.startedAt,lastConnectedAt:state.lastConnectedAt,lastDisconnectedAt:state.lastDisconnectedAt,lastError:state.lastError,reconnects:state.reconnects,backgroundConfigured:Boolean(config.backgroundFile),streamKeyConfigured:Boolean(config.streamKey),resolution:`${config.width}x${config.height}`,fps:config.fps,videoBitrateKbps:config.videoBitrateKbps,audioCodec:"mp3",audioSampleRate:44100,audioBitrateKbps:config.audioBitrateKbps,videoPrepared:state.videoPrepared,videoSamples:state.videoSamples};}
+  function info(){return{publisherRevision:"rtmp-control-v2",enabled:desired,autoStartEnabled:config.enabled,configured:Boolean(config.streamKey&&config.backgroundFile),status:state.status,connected:state.connected,desired,startedAt:state.startedAt,lastConnectedAt:state.lastConnectedAt,lastDisconnectedAt:state.lastDisconnectedAt,lastError:state.lastError,reconnects:state.reconnects,backgroundConfigured:Boolean(config.backgroundFile),streamKeyConfigured:Boolean(config.streamKey),resolution:`${config.width}x${config.height}`,fps:config.fps,videoBitrateKbps:config.videoBitrateKbps,audioCodec:"mp3",audioSampleRate:44100,audioBitrateKbps:config.audioBitrateKbps,connectTimeoutMs:config.connectTimeoutMs,connectionPhase:state.connectionPhase,lastRtmpStatusCode:state.lastRtmpStatusCode,lastRtmpWarning:state.lastRtmpWarning,videoPrepared:state.videoPrepared,videoSamples:state.videoSamples};}
 
   async function prepareVideo(){if(video)return video;state.status="preparing";video=await encodeStaticBackground({file:config.backgroundFile,width:config.width,height:config.height,fps:config.fps,gopSeconds:config.gopSeconds,bitrateKbps:config.videoBitrateKbps});state.videoPrepared=true;state.videoSamples=video.samples.length;return video;}
 
@@ -60,9 +60,12 @@ export function createYouTubePublisher({broadcast,options={}}={}){
   async function run(){
     try{await prepareVideo();}catch(error){state.status="error";state.lastError=safeError(error,config.streamKey);desired=false;runner=null;return;}
     while(desired){
-      state.status="connecting";client=new RtmpPublisher({url:config.url,streamKey:config.streamKey});let closedResolve;const closed=new Promise(resolve=>{closedResolve=resolve;});
+      state.status="connecting";state.connectionPhase="tls-connecting";client=new RtmpPublisher({url:config.url,streamKey:config.streamKey,connectTimeoutMs:config.connectTimeoutMs});let closedResolve;const closed=new Promise(resolve=>{closedResolve=resolve;});
+      client.on("phase",event=>{state.connectionPhase=String(event?.phase||"unknown");});
+      client.on("status",info=>{state.lastRtmpStatusCode=typeof info?.code==="string"?info.code:null;});
+      client.on("warning",info=>{state.lastRtmpWarning=String(info?.code||info?.description||"optional-command-rejected").slice(0,160);});
       client.on("error",error=>{state.lastError=safeError(error,config.streamKey);});client.on("close",()=>closedResolve());
-      try{await client.connect();if(!desired){client.close();break;}state.status="live";state.connected=true;state.lastConnectedAt=Date.now();if(!state.startedAt)state.startedAt=state.lastConnectedAt;startMedia();await closed;}catch(error){state.lastError=safeError(error,config.streamKey);}finally{stopMedia();state.connected=false;state.lastDisconnectedAt=Date.now();client?.close();client=null;}
+      try{await client.connect();if(!desired){client.close();break;}state.status="live";state.connected=true;state.connectionPhase="live";state.lastError=null;state.lastConnectedAt=Date.now();if(!state.startedAt)state.startedAt=state.lastConnectedAt;startMedia();await closed;}catch(error){state.lastError=safeError(error,config.streamKey);}finally{stopMedia();state.connected=false;state.lastDisconnectedAt=Date.now();client?.close();client=null;}
       if(desired){state.status="reconnecting";state.reconnects+=1;await sleep(config.reconnectMs);}
     }
     if(state.status!=="error")state.status="stopped";runner=null;
