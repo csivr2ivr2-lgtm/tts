@@ -1,6 +1,6 @@
 {
   "name": "aharon-tts-server",
-  "version": "0.9.1-rc.3",
+  "version": "0.9.1-rc.4",
   "private": true,
   "type": "module",
   "engines": {
@@ -8,7 +8,7 @@
   },
   "scripts": {
     "start": "node src/start.js",
-    "check": "node --check src/start.js && node --check src/server.js && node --check src/broadcast.js && node --check src/broadcast-job-store.js && node --check src/youtube/rtmp-client.js && node --check src/youtube/mp4-h264.js && node --check src/youtube/youtube-publisher.js",
+    "check": "node --check src/start.js && node --check src/server.js && node --check src/broadcast.js && node --check src/broadcast-job-store.js && node --check src/youtube/rtmp-client.js && node --check src/youtube/mp4-h264.js && node --check src/youtube/youtube-publisher.js && node --check src/youtube/pacing.js",
     "test": "node --test test/*.test.js"
   },
   "dependencies": {
