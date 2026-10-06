@@ -1,8 +1,10 @@
 import * as lame from "@breezystack/lamejs";
 import { RtmpPublisher } from "./rtmp-client.js";
 import { encodeStaticBackground } from "./mp4-h264.js";
+import { nextRealtimeVideoDue } from "./pacing.js";
 
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+
 
 class StreamingResampler{
   constructor(sourceRate,targetRate=44100){this.sourceRate=sourceRate;this.targetRate=targetRate;this.ratio=sourceRate/targetRate;this.data=new Int16Array(0);this.position=0;}
@@ -31,10 +33,10 @@ export function createYouTubePublisher({broadcast,options={}}={}){
   const config={
     enabled:options.enabled===true,url:options.url||"rtmps://a.rtmps.youtube.com/live2",streamKey:String(options.streamKey||"").trim(),backgroundFile:String(options.backgroundFile||"").trim(),width:Math.max(320,Number(options.width||1280)),height:Math.max(240,Number(options.height||720)),fps:Math.max(1,Math.min(60,Number(options.fps||30))),gopSeconds:Math.max(1,Math.min(4,Number(options.gopSeconds||2))),videoBitrateKbps:Math.max(300,Number(options.videoBitrateKbps||2500)),audioBitrateKbps:128,reconnectMs:Math.max(1000,Number(options.reconnectMs||5000)),connectTimeoutMs:Math.max(5000,Number(options.connectTimeoutMs||process.env.YOUTUBE_CONNECT_TIMEOUT_MS||30000)),
   };
-  let desired=false,runner=null,client=null,video=null,videoTimer=null,unsubscribePcm=null,resampler=null,audioSourceRate=null,pendingAudio=new Int16Array(0),mp3Encoder=null,mp3Splitter=null,audioSamplesSent=0,videoTimestamp=0,videoIndex=0,mediaEpoch=0;
+  let desired=false,runner=null,client=null,video=null,videoTimer=null,unsubscribePcm=null,resampler=null,audioSourceRate=null,pendingAudio=new Int16Array(0),mp3Encoder=null,mp3Splitter=null,audioSamplesSent=0,videoTimestamp=0,videoIndex=0,nextVideoDueAt=0;
   const state={status:"idle",connected:false,startedAt:null,lastConnectedAt:null,lastDisconnectedAt:null,lastError:null,reconnects:0,videoPrepared:false,videoSamples:0,connectionPhase:"idle",lastRtmpStatusCode:null,lastRtmpWarning:null};
 
-  function info(){return{publisherRevision:"rtmp-mp3-esm-v3",enabled:desired,autoStartEnabled:config.enabled,configured:Boolean(config.streamKey&&config.backgroundFile),status:state.status,connected:state.connected,desired,startedAt:state.startedAt,lastConnectedAt:state.lastConnectedAt,lastDisconnectedAt:state.lastDisconnectedAt,lastError:state.lastError,reconnects:state.reconnects,backgroundConfigured:Boolean(config.backgroundFile),streamKeyConfigured:Boolean(config.streamKey),resolution:`${config.width}x${config.height}`,fps:config.fps,videoBitrateKbps:config.videoBitrateKbps,audioCodec:"mp3",audioSampleRate:44100,audioBitrateKbps:config.audioBitrateKbps,connectTimeoutMs:config.connectTimeoutMs,connectionPhase:state.connectionPhase,lastRtmpStatusCode:state.lastRtmpStatusCode,lastRtmpWarning:state.lastRtmpWarning,videoPrepared:state.videoPrepared,videoSamples:state.videoSamples};}
+  function info(){return{publisherRevision:"rtmp-pacing-v4",videoPacing:"realtime-no-catchup",maxPlaybackRate:1,enabled:desired,autoStartEnabled:config.enabled,configured:Boolean(config.streamKey&&config.backgroundFile),status:state.status,connected:state.connected,desired,startedAt:state.startedAt,lastConnectedAt:state.lastConnectedAt,lastDisconnectedAt:state.lastDisconnectedAt,lastError:state.lastError,reconnects:state.reconnects,backgroundConfigured:Boolean(config.backgroundFile),streamKeyConfigured:Boolean(config.streamKey),resolution:`${config.width}x${config.height}`,fps:config.fps,videoBitrateKbps:config.videoBitrateKbps,audioCodec:"mp3",audioSampleRate:44100,audioBitrateKbps:config.audioBitrateKbps,connectTimeoutMs:config.connectTimeoutMs,connectionPhase:state.connectionPhase,lastRtmpStatusCode:state.lastRtmpStatusCode,lastRtmpWarning:state.lastRtmpWarning,videoPrepared:state.videoPrepared,videoSamples:state.videoSamples};}
 
   async function prepareVideo(){if(video)return video;state.status="preparing";video=await encodeStaticBackground({file:config.backgroundFile,width:config.width,height:config.height,fps:config.fps,gopSeconds:config.gopSeconds,bitrateKbps:config.videoBitrateKbps});state.videoPrepared=true;state.videoSamples=video.samples.length;return video;}
 
@@ -48,11 +50,21 @@ export function createYouTubePublisher({broadcast,options={}}={}){
 
   function sendVideoSequence(){const payload=Buffer.concat([Buffer.from([0x17,0x00,0,0,0]),video.avcC]);client.sendVideo(payload,0);}
   function pumpVideo(){
-    if(!desired||!client?.publishing||!video)return;const sample=video.samples[videoIndex];const header=Buffer.concat([Buffer.from([sample.key?0x17:0x27,0x01]),signed24(sample.compositionMs||0)]);try{client.sendVideo(Buffer.concat([header,sample.data]),Math.round(videoTimestamp));}catch(error){state.lastError=safeError(error,config.streamKey);client.close();return;}
-    videoTimestamp+=sample.durationMs;videoIndex=(videoIndex+1)%video.samples.length;const due=mediaEpoch+videoTimestamp,delay=Math.max(0,Math.min(1000,due-Date.now()));videoTimer=setTimeout(pumpVideo,delay);videoTimer.unref?.();
+    if(!desired||!client?.publishing||!video)return;
+    const sample=video.samples[videoIndex];
+    const durationMs=Number.isFinite(Number(sample.durationMs))&&Number(sample.durationMs)>0?Number(sample.durationMs):(1000/config.fps);
+    const header=Buffer.concat([Buffer.from([sample.key?0x17:0x27,0x01]),signed24(sample.compositionMs||0)]);
+    try{client.sendVideo(Buffer.concat([header,sample.data]),Math.round(videoTimestamp));}catch(error){state.lastError=safeError(error,config.streamKey);client.close();return;}
+    videoTimestamp+=durationMs;
+    videoIndex=(videoIndex+1)%video.samples.length;
+    // Never catch up by bursting frames after an event-loop stall. A live publisher
+    // may run late, but it must not advance media faster than wall-clock time.
+    nextVideoDueAt=nextRealtimeVideoDue({now:Date.now(),previousDue:nextVideoDueAt,durationMs,fps:config.fps});
+    const delay=Math.max(1,Math.min(1000,nextVideoDueAt-Date.now()));
+    videoTimer=setTimeout(pumpVideo,delay);videoTimer.unref?.();
   }
   function startMedia(){
-    resetAudio();videoTimestamp=0;videoIndex=0;mediaEpoch=Date.now();client.sendMetadata({width:config.width,height:config.height,framerate:config.fps,videocodecid:7,audiocodecid:2,videodatarate:config.videoBitrateKbps,audiodatarate:config.audioBitrateKbps,stereo:true,audiosamplerate:44100});sendVideoSequence();unsubscribePcm=broadcast.subscribePcm(onPcm);pumpVideo();
+    resetAudio();videoTimestamp=0;videoIndex=0;nextVideoDueAt=Date.now();client.sendMetadata({width:config.width,height:config.height,framerate:config.fps,videocodecid:7,audiocodecid:2,videodatarate:config.videoBitrateKbps,audiodatarate:config.audioBitrateKbps,stereo:true,audiosamplerate:44100});sendVideoSequence();unsubscribePcm=broadcast.subscribePcm(onPcm);pumpVideo();
   }
   function stopMedia(){if(videoTimer){clearTimeout(videoTimer);videoTimer=null;}if(unsubscribePcm){unsubscribePcm();unsubscribePcm=null;}resampler=null;pendingAudio=new Int16Array(0);mp3Encoder=null;mp3Splitter=null;}
 
