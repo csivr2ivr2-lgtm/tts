@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
-import { dirname, resolve } from "node:path";
+import { basename, dirname, extname, resolve } from "node:path";
 
 const require=createRequire(import.meta.url);
 
@@ -71,15 +71,15 @@ async function readBackgroundBytes(file){
     let encoded="";
     for(const rawName of manifest.parts){
       const name=String(rawName||"").trim();
-      if(!name||name.includes("..")||name.includes("/")||name.includes("\\"))throw new Error("Invalid YouTube background part name");
+      if(!name||name.includes("..")||name.includes("/")||name.includes("\"))throw new Error("Invalid YouTube background part name");
       encoded+=await readFile(resolve(dirname(location),name),"utf8");
     }
-    const bytes=Buffer.from(encoded.replace(/\s+/g,""),"base64");
+    const bytes=Buffer.from(encoded.replace(/s+/g,""),"base64");
     if(!bytes.length)throw new Error("Bundled YouTube background decoded to an empty file");
     return bytes;
   }
   const stored=await readFile(location);
-  return location.endsWith(".b64")?Buffer.from(stored.toString("ascii").replace(/\s+/g,""),"base64"):stored;
+  return location.endsWith(".b64")?Buffer.from(stored.toString("ascii").replace(/s+/g,""),"base64"):stored;
 }
 
 async function readBackgroundRgba(file,width,height){
@@ -92,8 +92,28 @@ async function readBackgroundRgba(file,width,height){
   return resizeCoverRgba(decoded.data,decoded.width,decoded.height,width,height);
 }
 
+export function preencodedBackgroundPath(file,{width=1280,height=720,fps=30,gopSeconds=2,bitrateKbps=2500}={}){
+  const exactDefault=width===1280&&height===720&&fps===30&&gopSeconds===2&&bitrateKbps===2500;
+  if(!exactDefault||!file)return null;
+  const configured=String(process.env.YOUTUBE_PREENCODED_BACKGROUND_FILE||"").trim();
+  if(configured)return configured;
+  const location=String(file);
+  const ext=extname(location);
+  const stem=basename(location,ext);
+  return resolve(dirname(location),`${stem}-1280x720-30fps.mp4`);
+}
+
 export async function encodeStaticBackground({file,width=1280,height=720,fps=30,gopSeconds=2,bitrateKbps=2500}={}){
   if(!file)throw new Error("YouTube background image file is required");
+  const preencoded=preencodedBackgroundPath(file,{width,height,fps,gopSeconds,bitrateKbps});
+  if(preencoded){
+    try{
+      const parsed=parseAvcMp4(await readBackgroundBytes(preencoded));
+      return {...parsed,preencoded:true,preencodedFile:preencoded};
+    }catch(error){
+      if(error?.code!=="ENOENT")console.warn("[YOUTUBE] preencoded background unavailable, falling back to runtime encoder:",error instanceof Error?error.message:String(error));
+    }
+  }
   const HME=require("h264-mp4-encoder");
   const rgba=await readBackgroundRgba(file,width,height);
   if(rgba.length!==width*height*4)throw new Error("Unexpected RGBA background size");
@@ -101,6 +121,6 @@ export async function encodeStaticBackground({file,width=1280,height=720,fps=30,
   try{
     encoder.outputFilename=output;encoder.width=width;encoder.height=height;encoder.frameRate=fps;encoder.kbps=bitrateKbps;encoder.speed=10;encoder.groupOfPictures=frameCount;encoder.initialize();
     for(let i=0;i<frameCount;i++)encoder.addFrameRgba(rgba);
-    encoder.finalize();const mp4=Buffer.from(encoder.FS.readFile(output));return parseAvcMp4(mp4);
+    encoder.finalize();const mp4=Buffer.from(encoder.FS.readFile(output));return {...parseAvcMp4(mp4),preencoded:false};
   }finally{try{encoder.FS.unlink(output);}catch{}encoder.delete();}
 }

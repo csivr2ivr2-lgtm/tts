@@ -4,7 +4,7 @@ import { createYouTubePublisher } from "./youtube/youtube-publisher.js";
 const DEFAULT_CHUNK_MS = Number(process.env.BROADCAST_CHUNK_MS || 100);
 const DEFAULT_GAP_MS = Number(process.env.BROADCAST_GAP_MS || 120);
 const MAX_QUEUE_SEGMENTS = Number(process.env.BROADCAST_MAX_QUEUE_SEGMENTS || 250);
-const DEFAULT_YOUTUBE_BACKGROUND = fileURLToPath(new URL("../assets/youtube/aharon-ai-radio-background.parts.json", import.meta.url));
+const DEFAULT_YOUTUBE_BACKGROUND = fileURLToPath(new URL("../assets/youtube/poto.png", import.meta.url));
 
 function clampPcm16(sample) {
   const x = Math.max(-1, Math.min(1, Number(sample) || 0));
@@ -31,7 +31,7 @@ export function streamingWavHeader(sampleRate, channels = 1, bitsPerSample = 16)
   header.writeUInt16LE(channels, 22);
   header.writeUInt32LE(sampleRate, 24);
   header.writeUInt32LE(byteRate, 28);
-  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(channels * (bitsPerSample / 8), 32);
   header.writeUInt16LE(bitsPerSample, 34);
   header.write("data", 36, "ascii");
   header.writeUInt32LE(0xffffffff, 40);
@@ -244,7 +244,6 @@ export function createBroadcastEngine(options = {}) {
     const displaced=displacementPlan(pcm.length+gapBytes,priority);
     if(!displaced)throw new Error("broadcast_queue_full");
     for(const queued of displaced){
-      // Persist the demotion before removing RAM audio; never silently discard it.
       if(!beforeDefer(publicItem(queued)))throw new Error("broadcast_queue_full");
       queue.splice(queue.indexOf(queued),1);emit({type:'deferred',segment:publicItem(queued),at:now()});
     }
@@ -384,4 +383,3 @@ export function createBroadcastEngine(options = {}) {
   };
   return api;
 }
-
