@@ -42,7 +42,7 @@ export function parseAvcMp4(input){
   const offsets=[];let sampleIndex=0;for(let chunkIndex=1;chunkIndex<=chunkOffsets.length&&sampleIndex<sizes.length;chunkIndex++){
     let entry=sc[0];for(const candidate of sc){if(candidate.firstChunk<=chunkIndex)entry=candidate;else break;}if(!entry)throw new Error("MP4 stsc has no entry for chunk "+chunkIndex);let pos=chunkOffsets[chunkIndex-1];for(let j=0;j<entry.samplesPerChunk&&sampleIndex<sizes.length;j++){offsets.push(pos);pos+=sizes[sampleIndex++];}
   }
-  if(offsets.length!==sizes.length)throw new Error(`MP4 sample map mismatch ${offsets.length}/${sizes.length}`);
+  if(offsets.length!==sizes.length)throw new Error("MP4 sample map mismatch "+offsets.length+"/"+sizes.length);
   const samples=sizes.map((size,i)=>{const start=offsets[i],end=start+size;if(start<0||end>buffer.length)throw new Error("MP4 sample outside file");const data=Buffer.from(buffer.subarray(start,end));return{data,durationMs:durations[i]*1000/timescale,compositionMs:composition[i]*1000/timescale,key:sync?sync.has(i+1):sampleIsKey(data)};});
   if(!samples.length)throw new Error("MP4 contains no video samples");if(!samples[0].key)samples[0].key=true;
   return{avcC,timescale,samples,durationMs:samples.reduce((n,s)=>n+s.durationMs,0)};
@@ -63,6 +63,10 @@ function resizeCoverRgba(source,sourceWidth,sourceHeight,width,height){
   return out;
 }
 
+function stripBase64Whitespace(value){
+  return String(value).split(" ").join("").split(String.fromCharCode(10)).join("").split(String.fromCharCode(13)).join("").split(String.fromCharCode(9)).join("");
+}
+
 async function readBackgroundBytes(file){
   const location=String(file||"");
   if(location.endsWith(".parts.json")){
@@ -71,15 +75,15 @@ async function readBackgroundBytes(file){
     let encoded="";
     for(const rawName of manifest.parts){
       const name=String(rawName||"").trim();
-      if(!name||name.includes("..")||name.includes("/")||name.includes("\"))throw new Error("Invalid YouTube background part name");
+      if(!name||name.includes("..")||name.includes("/")||name.includes(String.fromCharCode(92)))throw new Error("Invalid YouTube background part name");
       encoded+=await readFile(resolve(dirname(location),name),"utf8");
     }
-    const bytes=Buffer.from(encoded.replace(/s+/g,""),"base64");
+    const bytes=Buffer.from(stripBase64Whitespace(encoded),"base64");
     if(!bytes.length)throw new Error("Bundled YouTube background decoded to an empty file");
     return bytes;
   }
   const stored=await readFile(location);
-  return location.endsWith(".b64")?Buffer.from(stored.toString("ascii").replace(/s+/g,""),"base64"):stored;
+  return location.endsWith(".b64")?Buffer.from(stripBase64Whitespace(stored.toString("ascii")),"base64"):stored;
 }
 
 async function readBackgroundRgba(file,width,height){
@@ -100,7 +104,7 @@ export function preencodedBackgroundPath(file,{width=1280,height=720,fps=30,gopS
   const location=String(file);
   const ext=extname(location);
   const stem=basename(location,ext);
-  return resolve(dirname(location),`${stem}-1280x720-30fps.mp4`);
+  return resolve(dirname(location),stem+"-1280x720-30fps.mp4");
 }
 
 export async function encodeStaticBackground({file,width=1280,height=720,fps=30,gopSeconds=2,bitrateKbps=2500}={}){
@@ -117,7 +121,7 @@ export async function encodeStaticBackground({file,width=1280,height=720,fps=30,
   const HME=require("h264-mp4-encoder");
   const rgba=await readBackgroundRgba(file,width,height);
   if(rgba.length!==width*height*4)throw new Error("Unexpected RGBA background size");
-  const encoder=await HME.createH264MP4Encoder();const frameCount=Math.max(1,Math.round(fps*gopSeconds));const output=`youtube-${crypto.randomUUID()}.mp4`;
+  const encoder=await HME.createH264MP4Encoder();const frameCount=Math.max(1,Math.round(fps*gopSeconds));const output="youtube-"+crypto.randomUUID()+".mp4";
   try{
     encoder.outputFilename=output;encoder.width=width;encoder.height=height;encoder.frameRate=fps;encoder.kbps=bitrateKbps;encoder.speed=10;encoder.groupOfPictures=frameCount;encoder.initialize();
     for(let i=0;i<frameCount;i++)encoder.addFrameRgba(rgba);
