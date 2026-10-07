@@ -3,6 +3,19 @@ import { RtmpPublisher } from "./rtmp-client.js";
 import { encodeStaticBackground } from "./mp4-h264.js";
 import { nextRealtimeVideoDue } from "./pacing.js";
 
+// server.js may be launched directly by the host, bypassing src/start.js.
+// Prime the server's existing broadcast startup gate during module evaluation so
+// YouTube gets a 24 kHz silence clock immediately, then restore the music flag.
+const originalRadioMusicEnabled = process.env.RADIO_MUSIC_ENABLED;
+if (process.env.YOUTUBE_LIVE_ENABLED === "true" && originalRadioMusicEnabled !== "true") {
+  process.env.BROADCAST_SAMPLE_RATE ||= "24000";
+  process.env.RADIO_MUSIC_ENABLED = "true";
+  queueMicrotask(() => {
+    if (originalRadioMusicEnabled === undefined) delete process.env.RADIO_MUSIC_ENABLED;
+    else process.env.RADIO_MUSIC_ENABLED = originalRadioMusicEnabled;
+  });
+}
+
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 
 
