@@ -33,4 +33,22 @@ console.log = (...args) => {
 };
 
 fs.appendFileSync(sipLogFile, `${new Date().toISOString()} pid=${process.pid} [SIP] process-start\n`, "utf8");
-await import("./server.js");
+// YouTube must receive a continuous real-time stream from process startup, even
+// when Pocket TTS has not been loaded and there are no radio music assets.
+// server.js already primes the broadcast clock when RADIO_MUSIC_ENABLED=true;
+// borrow that bootstrap only during module initialization, then restore the flag.
+const originalRadioMusicEnabled = process.env.RADIO_MUSIC_ENABLED;
+const primeYouTubeBroadcastClock = process.env.YOUTUBE_LIVE_ENABLED === "true" && originalRadioMusicEnabled !== "true";
+if (primeYouTubeBroadcastClock) {
+  process.env.BROADCAST_SAMPLE_RATE ||= "24000";
+  process.env.RADIO_MUSIC_ENABLED = "true";
+  console.log("[YOUTUBE] priming continuous broadcast clock at process startup");
+}
+try {
+  await import("./server.js");
+} finally {
+  if (primeYouTubeBroadcastClock) {
+    if (originalRadioMusicEnabled === undefined) delete process.env.RADIO_MUSIC_ENABLED;
+    else process.env.RADIO_MUSIC_ENABLED = originalRadioMusicEnabled;
+  }
+}
